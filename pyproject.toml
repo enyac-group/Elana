@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "elana"
+version = "0.1.0"
+description = "Energy & Latency Analyzer for LLMs"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [
+  { name = "Hung-Yueh Chiang" }
+]
+
+# Put only the runtime deps you really need here
+dependencies = [
+  "torch>=2.7.0",
+  "transformers>=4.57.0",
+  "accelerate==1.11.0",
+  "HolisticTraceAnalysis>=0.2.0",
+  "mamba-ssm>=2.2.5",
+  "nvidia-ml-py",
+  "colorama",
+]
+
+[project.scripts]
+# CLI name  =  "module_path:callable"
+elana = "elana.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
