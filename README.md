@@ -3,7 +3,7 @@
 ![ELANA Logo](misc/elana.png)
 
 A lightweight, academic-friendly profiler for analyzing **model size**, **prefilling latency (TTFT)**, **generation latency (TPOT)**, and **end-to-end latency (TTLT)** of Large Language Models on mult-GPU and edge GPU plaforms. 
-ELLA provides a simple command-line interface and optional **energy consumption logging**, making it ideal for research on efficient LLM.
+ELANA provides a simple command-line interface and optional **energy consumption logging**, making it ideal for research on efficient LLM.
 
 ---
 
@@ -104,6 +104,6 @@ Here is a example of visualizing the details of a kernel
 - CUDA graph capture may not work for models with cpu operations, dynamic shapes or unconventional cache layouts.  
 - Energy logging is relied on GPU APIs from nvidia-ml-py.  
 - Torch profiler introduces significant overhead; recommended only for microbenchmarking, i.e., reduce the number of `repeats`
-- Some architectures (e.g., Nemotron-H, Mamba2) use custom KV-cache formats; ELLA includes compatibility paths but behaviors may vary.  
+- Some architectures (e.g., Nemotron-H, Mamba2) use custom KV-cache formats; ELANA includes compatibility paths but behaviors may vary.  
 - Assumes HuggingFace `AutoModelForCausalLM`-style forward API.
 
