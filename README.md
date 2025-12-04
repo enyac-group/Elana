@@ -2,7 +2,7 @@
 
 ![ELANA Logo](misc/elana.png)
 
-A lightweight, academic-friendly profiler for analyzing **model size**, **prefilling latency (TTFT)**, **generation latency (TPOT)**, and **end-to-end latency (TTLT)** of Large Language Models on mult-GPU and edge GPU plaforms. 
+A lightweight, academic-friendly profiler for analyzing **model size**, **prefilling latency (TTFT)**, **generation latency (TPOT)**, and **end-to-end latency (TTLT)** of Large Language Models on multi-GPU and edge GPU plaforms. 
 ELANA provides a simple command-line interface and optional **energy consumption logging**, making it ideal for research on efficient LLM.
 
 ---
