@@ -4,7 +4,6 @@ from functools import partial
 
 import torch
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.autograd.profiler import record_function
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
