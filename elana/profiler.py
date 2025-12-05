@@ -3,6 +3,8 @@ import logging
 from functools import partial
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.autograd.profiler import record_function
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -27,12 +29,14 @@ class ElanaProfiler:
         self.dtype = dtype
 
         # Get per-process device from torchrun (LOCAL_RANK will be set)
+        self.is_distributed = dist.is_available() and dist.is_initialized()
         self.local_rank = int(os.environ.get("LOCAL_RANK", 0))
         self.device = torch.device(f"cuda:{self.local_rank}")
         torch.cuda.set_device(self.device)
 
         # For CUDA graphs, we must be single-GPU, so override device_map
         if getattr(args, "cache_graph", False):
+            logger.warning(f"[Rank {self.local_rank}] CUDA graphs must be single-GPU, overriding device_map to None")
             device_map = None
 
         logger.info(
@@ -57,32 +61,53 @@ class ElanaProfiler:
 
     def _hf_build_model_and_tokenizer(self):
         """
-        Replace project-specific `build_model_and_tokenizer` with a standard
-        Hugging Face loading path.
+        Standard HF loading path for inference / profiling.
+
+        With torchrun:
+        - Each rank gets its own full model replica on a single GPU.
+        - No DDP wrapping, so all HF methods (generate, prepare_inputs_for_generation, etc.)
+            remain available on self.model.
         """
+
+        # --- Tokenizer ---
         logger.info(f"[Rank {self.local_rank}] Loading tokenizer from {self.args.model_repo}...")
         tokenizer = AutoTokenizer.from_pretrained(
             self.args.model_repo,
             use_fast=True,
             trust_remote_code=True,
         )
+        if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+            tokenizer.pad_token = tokenizer.eos_token
 
-        logger.info(f"[Rank {self.local_rank}] Loading model from {self.args.model_repo} with dtype={self.dtype}...")
-
-        if self.device_map is None:
-            # Single-GPU per rank; safe for CUDA graphs.
-            model = AutoModelForCausalLM.from_pretrained(
-                self.args.model_repo,
-                torch_dtype=self.dtype,
-                device_map=None,
-                trust_remote_code=True,
-            ).to(self.device)
+        # --- Device / rank ---
+        is_distributed = dist.is_available() and dist.is_initialized()
+        if is_distributed:
+            device = torch.device(f"cuda:{self.local_rank}")
+            torch.cuda.set_device(device)
         else:
-            # Fallback: HF sharding for non-graph usage.
+            device = self.device  # whatever you set (e.g., torch.device("cuda:0"))
+
+        logger.info(
+            f"[Rank {self.local_rank}] Loading model from {self.args.model_repo} "
+            f"with dtype={self.dtype} on {device}..."
+        )
+
+        # --- Model ---
+        if is_distributed or self.device_map is None:
+            # Single GPU per process
             model = AutoModelForCausalLM.from_pretrained(
                 self.args.model_repo,
-                torch_dtype=self.dtype,
+                dtype=self.dtype,
+                low_cpu_mem_usage=True,
+                trust_remote_code=True,
+            ).to(device)
+        else:
+            # Single-process multi-GPU sharding
+            model = AutoModelForCausalLM.from_pretrained(
+                self.args.model_repo,
+                dtype=self.dtype,
                 device_map=self.device_map,
+                low_cpu_mem_usage=True,
                 trust_remote_code=True,
             )
 
@@ -222,7 +247,7 @@ class ElanaProfiler:
                 elif "cache_params" in model_inputs: # mamba2
                     past_key_values = model_inputs["cache_params"]
                 else:
-                    print(model_inputs.keys())
+                    logger.error(f"Model inputs keys: {model_inputs.keys()}")
                     raise ValueError("Model does not have past_key_values or cache_params after prepare_inputs_for_generation")
         # HOTFIX (HY): Llama models will not get cache from prepare_inputs_for_generation
         # https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/generation/utils.py#L546
@@ -251,11 +276,10 @@ class ElanaProfiler:
         GB = 1000**3 # This is the SI (base-10) definition used by most storage manufacturers.
         if use_GiB:
             GB = 1024**3 # Binary (used by Linux/OS), aka GiB
-        print(past_key_values)
+        # print(past_key_values)
         cache_size = dynamic_cache_nbytes(past_key_values)
-        # conv_state_size, ssm_state_size, kv_cache_size = model_helper.get_cache_size(batch_size, prompt_len)
         cache_size_gb = cache_size / GB
-        logger.info(f'[Rank {self.local_rank}] cache size: {cache_size_gb:.3f} GB (batch size {batch_size}, prompt length {prompt_len}), detailed breakdown:')
+        logger.info(f'[Rank {self.local_rank}] cache size: {cache_size_gb:.3f} GB (batch size {batch_size}, prompt length {prompt_len})')
         # model total size and detailed layer type breakdown
         model_size_gb = (param_size + buffer_size) / GB
         logger.info(f'[Rank {self.local_rank}] model size: {model_size_gb:.3f} GB')
@@ -606,6 +630,8 @@ class ElanaProfiler:
         args = self.args
         model = self.model
         model_name = self.model_name
+        micro_batch_size = args.batch_size // getattr(args, "world_size", 1)
+        logger.info(f"[Rank {self.local_rank}] Using micro-batch size: {micro_batch_size}")
         metrics = {}
 
         # ---- size profiling ----
@@ -614,7 +640,7 @@ class ElanaProfiler:
                 logger.warning(f"[Rank {self.local_rank}] Model size profiling does not support energy measurement, ignore --energy")
             if args.cache_graph:
                 logger.warning(f"[Rank {self.local_rank}] Model size profiling does not support cache_graph mode, ignore --cache_graph")
-            model_size_gb, cache_size_gb = self.profile_size(model, args.batch_size, args.prompt_len)
+            model_size_gb, cache_size_gb = self.profile_size(model, micro_batch_size, args.prompt_len)
             metrics["model_size_gb"] = model_size_gb
             metrics["cache_size_gb"] = cache_size_gb
 
@@ -623,21 +649,22 @@ class ElanaProfiler:
             if args.cache_graph:
                 logger.warning(f"[Rank {self.local_rank}] TTFT does not support cache_graph mode, ignore --cache_graph")
             ttft_latency_ms, ttft_energy_j = self.profile_ttft(
-                batch_size=args.batch_size,
+                batch_size=micro_batch_size,
                 prompt_len=args.prompt_len,
                 repeats=args.repeats,
                 torch_profile=args.torch_profile,
                 torch_profile_dir=f"torch_profile/{model_name}",
             )
             metrics["ttft_latency_ms"] = ttft_latency_ms
-            metrics["ttft_energy_j_per_prompt"] = ttft_energy_j
+            if args.energy:
+                metrics["ttft_energy_j_per_prompt"] = ttft_energy_j
 
         # ---- TPOT ----
         if args.tpot:
             if args.gen_len > 1:
                 logger.warning(f"[Rank {self.local_rank}] TPOT only tests the latency with the given prompt length, ignore --gen_len")
             tpot_latency_ms, tpot_energy_j = self.profile_tpot(
-                batch_size=args.batch_size,
+                batch_size=micro_batch_size,
                 prompt_len=args.prompt_len,
                 repeats=args.repeats,
                 cache_graph=args.cache_graph,
@@ -645,12 +672,13 @@ class ElanaProfiler:
                 torch_profile_dir=f"torch_profile/{model_name}",
             )
             metrics["tpot_latency_ms"] = tpot_latency_ms
-            metrics["tpot_energy_j_per_token"] = tpot_energy_j
+            if args.energy:
+                metrics["tpot_energy_j_per_token"] = tpot_energy_j
 
         # ---- TTLT ----
         if args.ttlt:
             ttlt_latency_ms, ttlt_energy_j = self.profile_ttlt(
-                batch_size=args.batch_size,
+                batch_size=micro_batch_size,
                 prompt_len=args.prompt_len,
                 gen_len=args.gen_len,
                 repeats=args.repeats,
@@ -659,7 +687,8 @@ class ElanaProfiler:
                 torch_profile_dir=f"torch_profile/{model_name}",
             )
             metrics["ttlt_latency_ms"] = ttlt_latency_ms
-            metrics["ttlt_energy_j_per_request"] = ttlt_energy_j
+            if args.energy:
+                metrics["ttlt_energy_j_per_request"] = ttlt_energy_j
 
         if not args.size and not args.ttft and not args.tpot and not args.ttlt:
             logger.warning(

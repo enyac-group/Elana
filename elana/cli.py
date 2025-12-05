@@ -5,20 +5,23 @@ import sys
 import os
 
 def main():
-    parser = argparse.ArgumentParser(description="Elana launcher")
+    parser = argparse.ArgumentParser(
+        description="Elana launcher",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("model_repo", type=str, help="Model repo")
     parser.add_argument("--ngpus", type=int, default=1, help="number of GPUs")
-    parser.add_argument("--batch_size", type=int, default=1)
-    parser.add_argument("--prompt_len", type=int, default=1024)
-    parser.add_argument("--gen_len", type=int, default=128)
-    parser.add_argument("--repeats", type=int, default=100)
-    parser.add_argument("--tpot", action="store_true")
-    parser.add_argument("--ttft", action="store_true")
-    parser.add_argument("--ttlt", action="store_true")
-    parser.add_argument("--size", action="store_true")
-    parser.add_argument("--energy", action="store_true")
-    parser.add_argument("--cache_graph", action="store_true")
-    parser.add_argument("--log_level", type=str, default="INFO")
+    parser.add_argument("--batch_size", type=int, default=1, help="batch size")
+    parser.add_argument("--prompt_len", type=int, default=1024, help="prompt length")
+    parser.add_argument("--gen_len", type=int, default=128, help="generation length")
+    parser.add_argument("--repeats", type=int, default=100, help="number of repeats")
+    parser.add_argument("--tpot", action="store_true", help="enable time-per-output-token (generation only)")
+    parser.add_argument("--ttft", action="store_true", help="enable time-to-first-token (prefilling only)")
+    parser.add_argument("--ttlt", action="store_true", help="enable time-to-last-token (prefilling + generation)")
+    parser.add_argument("--size", action="store_true", help="enable size")
+    parser.add_argument("--energy", action="store_true", help="enable energy profiling")
+    parser.add_argument("--cache_graph", action="store_true", help="enable cache graph")
+    parser.add_argument("--log_level", type=str, default="INFO", help="log level")
 
     args, unknown = parser.parse_known_args()
 
