@@ -125,7 +125,7 @@ def main():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         if "energy" in key:
             if rank == 0:
-                logger.info(f"[GLOBAL] {key}: {tensor.item():.2f} Joules in total")  # sum energy
+                logger.info(f"[GLOBAL] {key}: {tensor.item():.2f} Joule in total")  # sum energy
         elif "latency" in key:
             tensor /= world_size  # average latency
             if rank == 0:

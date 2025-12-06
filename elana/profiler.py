@@ -176,7 +176,7 @@ class ElanaProfiler:
         - unit: "prompt", "token", or "request"
 
         Returns:
-            energy_per_unit_joules (float) or 0.0 if energy not enabled.
+            energy_per_unit_joule (float) or 0.0 if energy not enabled.
         """
         if ctx is None:
             return 0.0
@@ -184,7 +184,7 @@ class ElanaProfiler:
         stop_event, power_lists, proc = ctx
         stop_energy_logger_process(proc, stop_event)
 
-        total_joules = 0.0
+        total_joule = 0.0
         for gpu_index, gpu_power in enumerate(power_lists):
             watts = list(gpu_power)
 
@@ -197,11 +197,11 @@ class ElanaProfiler:
                 f"[Rank {self.local_rank}] Collected power {len(watts)} samples, "
                 f"avg power = {avg_power:.2f} W"
             )
-            energy_joules = avg_power * (dur_ms / 1000.0)
-            total_joules += energy_joules
+            energy_joule = avg_power * (dur_ms / 1000.0)
+            total_joule += energy_joule
 
         # average over repeats
-        energy_per_unit = total_joules / repeats if repeats > 0 else 0.0
+        energy_per_unit = total_joule / repeats if repeats > 0 else 0.0
         logger.info(f"[Rank {self.local_rank}] Total energy for all GPUs: {energy_per_unit:.2f} J / {unit}")
         return energy_per_unit
 
