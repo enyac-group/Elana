@@ -87,6 +87,12 @@ def setup_distributed():
 def main():
     args = parse_args()
     rank, world_size, local_rank = setup_distributed()
+    args.world_size = world_size
+    args.local_rank = local_rank
+    assert args.batch_size % world_size == 0, \
+        f"Batch size {args.batch_size} must be divisible by world size {world_size}"
+    assert args.batch_size >= world_size, \
+        f"Batch size {args.batch_size} must be >= world size {world_size}"
 
     setup_logging(args, rank)
     logger.highlight(f"Launching distributed ElanaProfiler with {world_size} ranks.")
@@ -104,7 +110,7 @@ def main():
     dist.barrier()
     if rank == 0:
         logger.highlight(f"All ranks finished Elana profiling.")
-        logger.highlight(f"Summarizing the energy and latency from {world_size} ranks.")
+        logger.highlight(f"Summarizing the energy, latency, and size from {world_size} ranks.")
 
 
     # ---- Global reduction (example for TPOT only) ----
@@ -119,14 +125,17 @@ def main():
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         if "energy" in key:
             if rank == 0:
-                logger.info(f"[GLOBAL] {key}: {tensor.item():.2f} Joules in total")  # sum energy
+                logger.info(f"[GLOBAL] {key}: {tensor.item():.2f} Joule in total")  # sum energy
         elif "latency" in key:
             tensor /= world_size  # average latency
             if rank == 0:
                 logger.info(f"[GLOBAL] {key}: {tensor.item():.2f} ms average")
-        elif "size" in key:
+        elif "model_size" in key:
             if rank == 0:
-                logger.info(f"[GLOBAL] {key}: {value:.2f} GB") # we only use the value from rank 0
+                logger.info(f"[GLOBAL] {key}: {value:.2f} GB at rank {rank}") # we only use the value from rank 0
+        elif "cache_size" in key:
+            if rank == 0:
+                logger.info(f"[GLOBAL] {key}: {value:.2f} GB at rank {rank}, {tensor.item():.2f} GB in total") # we only use the value from rank 0
         else:
             raise ValueError(f"Unknown metric for reduction: {key}")
 

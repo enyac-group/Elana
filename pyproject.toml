@@ -20,6 +20,7 @@ dependencies = [
   "accelerate==1.11.0",
   "HolisticTraceAnalysis>=0.2.0",
   "mamba-ssm>=2.2.5",
+  "causal-conv1d",
   "nvidia-ml-py",
   "colorama",
 ]
