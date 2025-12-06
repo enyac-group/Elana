@@ -1,25 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-
 MODELS=(
   "meta-llama/Llama-3.1-8B"
   "Qwen/Qwen2.5-7B"
 )
 
+# We could only use ngpus 1 on Jetson Thor, and we don't set CUDA_VISIBLE_DEVICES
 WORKLOADS=(
   # ngpus=1, bsz=1, L=512
   "--ttft --tpot --ngpus 1 --batch_size 1 --prompt_len 512 --gen_len 512 --energy --cache_graph --repeats 100"
   "--ttlt           --ngpus 1 --batch_size 1 --prompt_len 512 --gen_len 512 --energy --cache_graph --repeats 20"
 
-  # ngpus=4, bsz=64, L=512
-  "--ttft --tpot --ngpus 4 --batch_size 64 --prompt_len 512 --gen_len 512 --energy --cache_graph --repeats 100"
-  "--ttlt           --ngpus 4 --batch_size 64 --prompt_len 512 --gen_len 512 --energy --cache_graph --repeats 20"
+  # ngpus=1, bsz=16, L=512
+  "--ttft --tpot --ngpus 1 --batch_size 16 --prompt_len 512 --gen_len 512 --energy --cache_graph --repeats 100"
+  "--ttlt           --ngpus 1 --batch_size 16 --prompt_len 512 --gen_len 512 --energy --cache_graph --repeats 20"
 
-  # ngpus=4, bsz=64, L=1024
-  "--ttft --tpot --ngpus 4 --batch_size 64 --prompt_len 1024 --gen_len 1024 --energy --cache_graph --repeats 100"
-  "--ttlt           --ngpus 4 --batch_size 64 --prompt_len 1024 --gen_len 1024 --energy --cache_graph --repeats 20"
+  # ngpus=1, bsz=16, L=1024
+  "--ttft --tpot --ngpus 1 --batch_size 16 --prompt_len 1024 --gen_len 1024 --energy --cache_graph --repeats 100"
+  "--ttlt           --ngpus 1 --batch_size 16 --prompt_len 1024 --gen_len 1024 --energy --cache_graph --repeats 20"
 )
 
 LOG_DIR="elana_logs"
