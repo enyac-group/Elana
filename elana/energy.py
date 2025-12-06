@@ -8,6 +8,8 @@ from datetime import datetime
 # to profile gpu power
 try:
     from pynvml import *
+    handle = nvmlDeviceGetHandleByIndex(0)
+    nvmlDeviceGetPowerUsage(handle)
     _NVML_AVAILABLE = True
 except Exception as e:
     _NVML_AVAILABLE = False

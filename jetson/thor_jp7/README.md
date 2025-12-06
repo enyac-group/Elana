@@ -102,8 +102,66 @@ True
     ImportError: libcudss.so.0: cannot open shared object file: No such file or directory
     ```
     Follow the [instruction](https://developer.nvidia.com/cudss-downloads?target_os=Linux&target_arch=arm64-sbsa&Compilation=Native&Distribution=Ubuntu&target_version=24.04&target_type=deb_local) to download `cudss`: Linux -> arm64-sbsa -> Native -> Ubuntu -> 24.04 -> deb (local). Then, install `cudss`.
+- jtop.core.exceptions.JtopException: I can't access jtop.service.
+    ```
+    PermissionError: [Errno 13] Permission denied
 
+    During handling of the above exception, another exception occurred:
 
+    Traceback (most recent call last):
+        ...
+        raise JtopException("I can't access jtop.service.\nPlease logout or reboot this board.")
+    jtop.core.exceptions.JtopException: I can't access jtop.service.
+    Please logout or reboot this board.
+    ```
+    1. try to add yourself to the jtop group. Then, run `jtop`
+    ```bash
+    sudo usermod -a -G jtop $USER
+    newgrp jtop
+    ``` 
+    2. `Mismatch version jtop service`, and check the `jtop` vesion in `elana-env`
+    ```bash
+    Mismatch version jtop service: [4.5.4] and client: [4.3.2]. Please run:
+    sudo systemctl restart jtop.service
+    ```
+    
+    ```bash
+    >>> import jtop
+    >>> jtop.__version__
+    '4.3.2'
+    >>> 
+    ```
+
+    3. uninstall `jetson-stats` from `elana-env`, and clean the hash table
+    ```bash
+    pip uninstall jetson-stats
+    type jtop      # jtop is hashed (/home/hc29225/Documents/Elana/elana-env/bin/jtop)
+    hash -r        # clears the command hash table
+    ```
+
+    4. check the system jtop
+    ```bash
+    $ ls /opt/jtop/venv/bin/python
+    /opt/jtop/venv/bin/python
+    $ sudo /opt/jtop/venv/bin/python -c "import jtop, site; \
+    print('service jtop version:', jtop.__version__); \
+    print('site-packages:', [p for p in site.getsitepackages() if 'site-packages' in p][0])"
+    service jtop version: 4.5.4
+    site-packages: /opt/jtop/venv/lib/python3.12/site-packages
+    ```
+
+    5. export the system jtop path
+    ```bash
+    export PYTHONPATH=/opt/jtop/venv/lib/python3.12/site-packages:$PYTHONPATH
+    ```
+
+    6. sanity check the `jtop` in the `elana-env`
+    ```bash
+    >>> import jtop
+    >>> jtop.__version__
+    '4.5.4'
+    >>> 
+    ```
 
 ## Install Elana
 Finall, we install elana on jetson thor. All dependencies should already be installed
