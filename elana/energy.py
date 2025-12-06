@@ -65,10 +65,10 @@ def get_visible_gpus():
 """
 # Rails that often carry GPU power on Jetson
 GPU_RAIL_CANDIDATES = [
-    "VDD_GPU_SOC",
-    "VDD_SYS_GPU",
-    "VDD_GPU",
-    "GPU",
+    "VDD_GPU_SOC",  # Orin
+    "VDD_SYS_GPU",  # TX2
+    "VDD_GPU",      # Nano / Xavier
+    "GPU",          # Generic alias in some tools
 ]
 
 def find_nano_gpu_rail_name(rail_dict):
@@ -111,7 +111,7 @@ def read_nano_gpu_power_once(power_data):
 
 def log_gpu_stats(
     gpu_index=0,
-    log_interval=0.5,
+    log_interval=0.1,
     log_file="gpu_power_log.csv",
     stop_event: Optional[Event] = None,
     shared_power_list=None,
@@ -139,7 +139,7 @@ def log_gpu_stats(
                     break
 
                 ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                power = nvmlDeviceGetPowerUsage(handle) / 1000.0
+                power = nvmlDeviceGetPowerUsage(handle) / 1000.0 # mW to W
                 util  = nvmlDeviceGetUtilizationRates(handle).gpu
                 temp  = nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
 
@@ -188,35 +188,6 @@ def log_gpu_stats(
         finally:
             # process stop
             pass
-
-
-# def launch_energy_logger_process():
-#     # Get the list of visible GPU indices (physical ids)
-#     visible_gpus = get_visible_gpus()   # <-- call the function, store result
-#     manager = Manager()
-#     stop_event = Event()
-#     proc_list = []
-#     power_lists = []
-
-#     # Launch one logger process per visible GPU
-#     for gpu_index in visible_gpus:
-#         gpu_power = manager.list()
-#         power_lists.append(gpu_power)
-#         logger.info(f"Launching GPU energy logger on GPU {gpu_index}")
-#         proc = Process(
-#             target=log_gpu_stats,
-#             kwargs=dict(
-#                 gpu_index=gpu_index,              # which GPU to sample
-#                 log_interval=0.1,
-#                 log_file=f"gpu{gpu_index}_power_log.csv",
-#                 stop_event=stop_event,
-#                 shared_power_list=gpu_power,
-#             ),
-#         )
-#         proc.start()
-#         proc_list.append(proc)
-
-#     return stop_event, power_lists, proc_list
 
 
 def launch_energy_logger_process():
