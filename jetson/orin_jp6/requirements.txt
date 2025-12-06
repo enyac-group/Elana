@@ -1,0 +1,5 @@
+transformers>=4.57.0
+accelerate==1.11.0
+HolisticTraceAnalysis>=0.2.0
+colorama
+

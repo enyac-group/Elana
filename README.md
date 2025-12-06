@@ -44,7 +44,7 @@ pip install --upgrade pip
 
 ---
 
-## 📦 Install Dependencies
+## 📦 Install Elana and its Dependencies
 
 ```bash
 pip install .
