@@ -162,6 +162,10 @@ True
     '4.5.4'
     >>> 
     ```
+- RuntimeError: Cannot find ptxas
+    ```bash
+    export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+    ```
 
 ## Install Elana
 Finall, we install elana on jetson thor. All dependencies should already be installed
