@@ -61,19 +61,19 @@ bash install_packages.sh
 >>> torch.cuda.is_available()
 True
 >>> torch.__version__
-'2.9.0'
+'2.8.0'
 >>> import triton
 >>> triton.__version__
-'3.5.0'
+'3.4.0'
 >>> import flash_attn
 >>> flash_attn.__version__
-'2.8.4'
+'2.8.2'
 >>> import mamba_ssm
 >>> mamba_ssm.__version__
-'2.2.6.post2'
+'2.2.5'
 >>> import causal_conv1d
 >>> causal_conv1d.__version__
-'1.5.3'
+'1.5.2'
 >>> 
 ```
 

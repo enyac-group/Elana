@@ -25,6 +25,8 @@ import torch.nn as nn
 
 logger = logging.getLogger(os.path.basename(__file__))
 
+if not _JTOP_AVAILABLE and not _NVML_AVAILABLE:
+    logger.warning("Neither pynvml nor jtop is available; GPU power profiling results will be zero.")
 
 def get_visible_gpus():
     """
