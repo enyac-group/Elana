@@ -21,7 +21,7 @@ WORKLOADS=(
   "--ttlt           --ngpus 1 --batch_size 16 --prompt_len 1024 --gen_len 1024 --energy --cache_graph --repeats 20"
 )
 
-LOG_DIR="elana_logs"
+LOG_DIR="elana_logs/thor"
 mkdir -p "${LOG_DIR}"
 
 for model in "${MODELS[@]}"; do
