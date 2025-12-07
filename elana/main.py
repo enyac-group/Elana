@@ -81,7 +81,10 @@ def setup_distributed():
     rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
 
-    dist.init_process_group(backend=get_backend(), rank=rank, world_size=world_size)
+    backend = get_backend()
+    if backend == "aarch64":
+        assert world_size == 1, "Distributed not supported on Jetson currently."
+    dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
 
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     torch.cuda.set_device(local_rank)
