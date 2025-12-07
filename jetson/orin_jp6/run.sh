@@ -20,7 +20,7 @@ WORKLOADS=(
 
 )
 
-LOG_DIR="elana_logs/thor"
+LOG_DIR="elana_logs/nano"
 mkdir -p "${LOG_DIR}"
 
 for model in "${MODELS[@]}"; do
