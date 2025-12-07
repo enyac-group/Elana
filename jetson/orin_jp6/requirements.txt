@@ -1,5 +1,6 @@
 transformers>=4.57.0
 accelerate==1.11.0
 HolisticTraceAnalysis>=0.2.0
+numpy==1.26.4 # degrade the version for transformers
 colorama
 

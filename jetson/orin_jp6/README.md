@@ -6,7 +6,7 @@
 ## Clone repository
 ```bash
 git clone https://github.com/hychiang-git/Elana.git
-cd Elana/jetson/orin_jp6
+cd Elana
 ```
 
 ### Using virtualenv
@@ -22,14 +22,26 @@ pip install --upgrade pip
 nvcc -V
 # you should see
 nvcc: NVIDIA (R) Cuda compiler driver
-Copyright (c) 2005-2025 NVIDIA Corporation
-Built on Fri_Nov__7_07:24:07_PM_PST_2025
-Cuda compilation tools, release 13.1, V13.1.80
-Build cuda_13.1.r13.1/compiler.36836380_0
+Copyright (c) 2005-2024 NVIDIA Corporation
+Built on Wed_Aug_14_10:14:07_PDT_2024
+Cuda compilation tools, release 12.6, V12.6.68
+Build cuda_12.6.r12.6/compiler.34714021_0
+```
+or
+```
+# nvcc should already exist on Orin Nano
+ls /usr/local/cuda/bin/nvcc
+echo "export PATH=/usr/local/cuda/bin:$PATH" >> ~/.bashrc
+echo "export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH" >> ~/.bashrc
+source ~/.bashrc
 ```
 
 
 ## Install Dependencies
+0. go to `jetson/orin_jp6` folder
+```bash
+cd jetson/orin_jp6
+```
 
 1. Install packages in the requirements.txt
 ```bash
