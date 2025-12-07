@@ -5,7 +5,7 @@ set -euo pipefail
 echo "=== Jetson Thor wheel installer (CUDA 13.0, Python 3.12) ==="
 
 # Directory for downloaded wheels
-WHEEL_DIR="wheels"
+WHEEL_DIR="wheels_jp7"
 mkdir -p $WHEEL_DIR
 cd $WHEEL_DIR
 

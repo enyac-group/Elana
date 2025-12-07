@@ -6,7 +6,7 @@
 ## Clone repository
 ```bash
 git clone https://github.com/hychiang-git/Elana.git
-cd Elana/jetson/thor_jp7
+cd Elana
 ```
 
 ### Using virtualenv
@@ -18,7 +18,7 @@ pip install --upgrade pip
 ```
 
 ## Install CUDA Toolkit 13.1
-Follow the official [document](https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/setup_cuda.html#ways-to-natively-install-cuda-toolkit) to install CUDA Toolkit first.
+If `/usr/local/cuda/bin/nvcc` does not exist, follow the official [document](https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/setup_cuda.html#ways-to-natively-install-cuda-toolkit) to install CUDA Toolkit first.
 
 Remember to add the following lines to your ~/.bashrc file, see [here](https://docs.nvidia.com/jetson/agx-thor-devkit/user-guide/latest/setup_cuda.html#post-install-setup-cuda-path-configuration)
 ```bash
@@ -40,6 +40,10 @@ Build cuda_13.1.r13.1/compiler.36836380_0
 
 
 ## Install Dependencies
+0. go to `jetson/thor_jp7` folder
+```bash
+cd jetson/thor_jp7
+```
 
 1. Install packages in the requirements.txt
 ```bash
