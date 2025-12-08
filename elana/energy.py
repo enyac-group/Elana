@@ -8,6 +8,8 @@ from datetime import datetime
 # to profile gpu power
 try:
     from pynvml import *
+    handle = nvmlDeviceGetHandleByIndex(0)
+    nvmlDeviceGetPowerUsage(handle)
     _NVML_AVAILABLE = True
 except Exception as e:
     _NVML_AVAILABLE = False
@@ -23,6 +25,8 @@ import torch.nn as nn
 
 logger = logging.getLogger(os.path.basename(__file__))
 
+if not _JTOP_AVAILABLE and not _NVML_AVAILABLE:
+    logger.warning("Neither pynvml nor jtop is available; GPU power profiling results will be zero.")
 
 def get_visible_gpus():
     """

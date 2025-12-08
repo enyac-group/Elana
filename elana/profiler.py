@@ -226,8 +226,8 @@ class ElanaProfiler:
 
     def profile_size(self, model, batch_size=1, prompt_len=1024, use_GiB=False):
 
-        logger.info(">>> Profiling model size")
-        logger.info("Start profiling...")
+        logger.info(f"[Rank {self.local_rank}] >>> Profiling model size")
+        logger.info(f"[Rank {self.local_rank}] Start profiling...")
 
         device = self.device
         vocab_size = self.vocab_size
@@ -236,7 +236,7 @@ class ElanaProfiler:
         dummy_prompt = torch.randint(
             low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
         )
-        logger.info("Prefilling KV cache...")
+        logger.info(f"[Rank {self.local_rank}] Prefilling {prompt_len} tokens to KV cache...")
         if hasattr(model, "prepare_inputs_for_generation"):
             # Nemotron-H and Mamba2
             with torch.no_grad():
@@ -364,7 +364,7 @@ class ElanaProfiler:
             low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
         )
 
-        logger.info("Prefilling KV cache...")
+        logger.info(f"[Rank {self.local_rank}] Prefilling {prompt_len} tokens to KV cache...")
         with torch.no_grad():
             outputs = self.model(
                 dummy_prompt,
