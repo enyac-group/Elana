@@ -107,3 +107,12 @@ Here is a example of visualizing the details of a kernel
 - Some architectures (e.g., Nemotron-H, Mamba2) use custom KV-cache formats; ELANA includes compatibility paths but behaviors may vary.  
 - Assumes HuggingFace `AutoModelForCausalLM`-style forward API.
 
+## Citation
+```
+@article{chiang2025elana,
+  title = {ELANA: A Simple Energy and Latency Analyzer for LLMs},
+  author = {Chiang, Hung-Yueh and Wang, Bokun and Marculescu, Diana},
+  journal = {arXiv preprint arXiv:2512.09946},
+  year = {2025},
+}
+````
