@@ -23,6 +23,7 @@ dependencies = [
   "causal-conv1d",
   "nvidia-ml-py",
   "colorama",
+  "datasets",
 ]
 
 [project.scripts]

@@ -34,6 +34,12 @@ def parse_args():
     parser.add_argument("--energy", action="store_true")
     parser.add_argument("--cache_graph", action="store_true")
     parser.add_argument("--torch_profile", action="store_true")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Use HumanEval coding benchmark prompts instead of random inputs")
+    parser.add_argument("--num_prompts", type=int, default=None,
+                        help="Number of benchmark prompts to use (default: all 164)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print input prompts and generated outputs (TTLT benchmark mode only)")
 
     parser.add_argument(
         "--device_map",

@@ -56,6 +56,14 @@ class ElanaProfiler:
         # Convenience handle
         self.vocab_size = self.model.config.vocab_size
 
+        self.verbose = getattr(args, "verbose", False)
+
+        # Load benchmark data if requested
+        self._benchmark_prompts = None
+        self._benchmark_idx = 0
+        if getattr(args, "benchmark", False):
+            self._load_benchmark_data()
+
     # ---------------------- model loading ----------------------
 
     def _hf_build_model_and_tokenizer(self):
@@ -112,6 +120,52 @@ class ElanaProfiler:
 
         return model, tokenizer
 
+    # ---------------------- benchmark data ----------------------
+
+    def _load_benchmark_data(self):
+        """Load and tokenize HumanEval coding benchmark prompts at their natural lengths."""
+        from datasets import load_dataset
+
+        logger.info(f"[Rank {self.local_rank}] Loading HumanEval benchmark dataset...")
+        dataset = load_dataset("openai/openai_humaneval", split="test")
+
+        has_chat_template = hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template is not None
+
+        all_prompts = []
+        for sample in dataset:
+            if has_chat_template:
+                messages = [{"role": "user", "content": sample["prompt"]}]
+                token_ids = self.tokenizer.apply_chat_template(
+                    messages, return_tensors="pt", add_generation_prompt=True,
+                )
+            else:
+                token_ids = self.tokenizer(
+                    sample["prompt"],
+                    return_tensors="pt",
+                    truncation=False,
+                )["input_ids"]
+            # shape: (1, natural_len)
+            all_prompts.append(token_ids.to(self.device))
+
+        num_prompts = getattr(self.args, "num_prompts", None)
+        if num_prompts is not None:
+            num_prompts = min(num_prompts, len(all_prompts))
+            all_prompts = all_prompts[:num_prompts]
+
+        self._benchmark_prompts = all_prompts
+        self._benchmark_idx = 0
+        lengths = [p.shape[1] for p in self._benchmark_prompts]
+        logger.info(
+            f"[Rank {self.local_rank}] Loaded {len(self._benchmark_prompts)} HumanEval prompts "
+            f"(token lengths: {min(lengths)}-{max(lengths)}, mean={sum(lengths)/len(lengths):.0f})"
+        )
+
+    def _next_benchmark_prompt(self):
+        """Return the next benchmark prompt at its natural length (batch_size=1)."""
+        prompt = self._benchmark_prompts[self._benchmark_idx]
+        self._benchmark_idx = (self._benchmark_idx + 1) % len(self._benchmark_prompts)
+        return prompt
+
     # ---------------------- common helpers ----------------------
 
     def _run_torch_profiler(
@@ -154,6 +208,8 @@ class ElanaProfiler:
                 inner_loop_fn(prof)
 
     def _make_prompt(self, batch_size, prompt_len):
+        if self._benchmark_prompts is not None:
+            return self._next_benchmark_prompt()
         return torch.randint(
             low=0,
             high=self.vocab_size,
@@ -233,10 +289,9 @@ class ElanaProfiler:
         vocab_size = self.vocab_size
 
         # Dummy prompt for prefilling KV cache
-        dummy_prompt = torch.randint(
-            low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-        )
-        logger.info(f"[Rank {self.local_rank}] Prefilling {prompt_len} tokens to KV cache...")
+        dummy_prompt = self._make_prompt(batch_size, prompt_len)
+        actual_prompt_len = dummy_prompt.shape[1]
+        logger.info(f"[Rank {self.local_rank}] Prefilling {actual_prompt_len} tokens to KV cache...")
         if hasattr(model, "prepare_inputs_for_generation"):
             # Nemotron-H and Mamba2
             with torch.no_grad():
@@ -278,7 +333,7 @@ class ElanaProfiler:
         # print(past_key_values)
         cache_size = dynamic_cache_nbytes(past_key_values)
         cache_size_gb = cache_size / GB
-        logger.info(f'[Rank {self.local_rank}] cache size: {cache_size_gb:.3f} GB (batch size {batch_size}, prompt length {prompt_len})')
+        logger.info(f'[Rank {self.local_rank}] cache size: {cache_size_gb:.3f} GB (batch size {batch_size}, prompt length {actual_prompt_len})')
         # model total size and detailed layer type breakdown
         model_size_gb = (param_size + buffer_size) / GB
         logger.info(f'[Rank {self.local_rank}] model size: {model_size_gb:.3f} GB')
@@ -291,14 +346,21 @@ class ElanaProfiler:
                      repeats=100, torch_profile=False, torch_profile_dir=""):
         logger.info(f"[Rank {self.local_rank}] >>> Profiling TTFT (prefilling stage) for {repeats} times")
 
-        prompt = self._make_prompt(batch_size, prompt_len)
+        use_benchmark = self._benchmark_prompts is not None
 
-        logger.info(f"[Rank {self.local_rank}] Testing (batch_size, prompt_len): ({batch_size}, {prompt_len})")
+        if use_benchmark:
+            logger.info(
+                f"[Rank {self.local_rank}] Testing with HumanEval prompts at natural lengths (batch_size=1)"
+            )
+        else:
+            logger.info(f"[Rank {self.local_rank}] Testing (batch_size, prompt_len): ({batch_size}, {prompt_len})")
+
         logger.info(f"[Rank {self.local_rank}] Warmup...")
         with torch.no_grad():
             for _ in range(5):
+                p = self._make_prompt(batch_size, prompt_len)
                 _ = self.model(
-                    prompt,
+                    p,
                     use_cache=True,
                     output_hidden_states=False,
                     output_attentions=False,
@@ -309,8 +371,9 @@ class ElanaProfiler:
         energy_ctx = self._maybe_start_energy_logger()
 
         def _run_once():
+            p = self._make_prompt(batch_size, prompt_len)
             _ = self.model(
-                prompt,
+                p,
                 use_cache=True,
                 output_hidden_states=False,
                 output_attentions=False,
@@ -326,13 +389,14 @@ class ElanaProfiler:
         )
 
         if torch_profile:
-            outfile_prefix = f"ttft_prompt_len_{prompt_len}"
+            outfile_prefix = f"ttft_prompt_len_{'humaneval' if use_benchmark else prompt_len}"
 
             def _inner(prof):
                 for _ in range(5):
                     with record_function("## forward ##"):
+                        p = self._make_prompt(batch_size, prompt_len)
                         _ = self.model(
-                            prompt,
+                            p,
                             use_cache=True,
                             output_hidden_states=False,
                             output_attentions=False,
@@ -346,7 +410,7 @@ class ElanaProfiler:
                 inner_loop_fn=_inner,
                 warn_msg=None,
             )
-        
+
         return avg_ms, energy_prompt
 
     # ---------------------- TPOT ----------------------
@@ -359,12 +423,10 @@ class ElanaProfiler:
         device = self.device
         vocab_size = self.vocab_size
 
-        # Dummy prompt for prefilling KV cache
-        dummy_prompt = torch.randint(
-            low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-        )
+        # Prompt for prefilling KV cache
+        dummy_prompt = self._make_prompt(batch_size, prompt_len)
 
-        logger.info(f"[Rank {self.local_rank}] Prefilling {prompt_len} tokens to KV cache...")
+        logger.info(f"[Rank {self.local_rank}] Prefilling {dummy_prompt.shape[1]} tokens to KV cache...")
         with torch.no_grad():
             outputs = self.model(
                 dummy_prompt,
@@ -488,9 +550,7 @@ class ElanaProfiler:
         # cache the graph for generation
         if cache_graph:
             torch.cuda.set_device(self.device)  # NEW
-            dummy_prompt = torch.randint(
-                low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-            )
+            dummy_prompt = self._make_prompt(batch_size, prompt_len)
             with torch.no_grad():
                 outputs = self.model(
                     dummy_prompt,
@@ -552,10 +612,9 @@ class ElanaProfiler:
                 )
                 return out
 
-        def run_once(batch_size, prompt_len, gen_len):
-            prompt = torch.randint(
-                low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-            )
+        def run_once(batch_size, prompt_len, gen_len, verbose=False):
+            prompt = self._make_prompt(batch_size, prompt_len)
+            actual_prompt_len = prompt.shape[1]
             sequences = [prompt]
 
             # prefilling
@@ -574,8 +633,12 @@ class ElanaProfiler:
             sequences.append(sampled_tokens)
 
             # generation
+            eos_token_id = self.tokenizer.eos_token_id
             current_past_key_values = past_key_values
-            for _ in range(gen_len - 1):  # one token already generated
+            for i in range(gen_len - 1):  # one token already generated
+                if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
+                    break
+                cache_position.fill_(actual_prompt_len + i)
                 outputs = generate(sequences[-1], current_past_key_values)
                 if hasattr(outputs, "past_key_values"):
                     current_past_key_values = outputs.past_key_values
@@ -584,22 +647,45 @@ class ElanaProfiler:
                 sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
 
+            actual_gen_len = len(sequences) - 1  # exclude the prompt
+            run_stats.append((actual_prompt_len, actual_gen_len))
+
+            if verbose and self._benchmark_prompts is not None:
+                input_text = self.tokenizer.decode(prompt[0], skip_special_tokens=True)
+                generated_tokens = torch.cat(sequences[1:], dim=-1)
+                output_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+                logger.info(f"[Rank {self.local_rank}] [INPUT]\n{input_text}")
+                logger.info(f"[Rank {self.local_rank}] [OUTPUT]\n{output_text}")
+
+        run_stats = []
+
         logger.info(f"[Rank {self.local_rank}] Warmup...")
         with torch.no_grad():
             for _ in range(5):
-                run_once(batch_size, prompt_len, gen_len)
+                run_once(batch_size, prompt_len, gen_len, verbose=False)
+
+        run_stats.clear()
 
         logger.info(f"[Rank {self.local_rank}] Start profiling...")
         energy_ctx = self._maybe_start_energy_logger()
 
         def _run():
-            run_once(batch_size, prompt_len, gen_len)
+            run_once(batch_size, prompt_len, gen_len, verbose=self.verbose)
 
         dur = self._time_repeated(repeats, _run)
         avg_ms = dur / repeats
-        logger.info(
-            f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} milliseconds (cache_graph={cache_graph})"
-        )
+
+        if run_stats:
+            avg_prompt = sum(s[0] for s in run_stats) / len(run_stats)
+            avg_gen = sum(s[1] for s in run_stats) / len(run_stats)
+            logger.info(
+                f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} ms (cache_graph={cache_graph}), "
+                f"avg prompt_len: {avg_prompt:.0f}, avg gen_len: {avg_gen:.0f}"
+            )
+        else:
+            logger.info(
+                f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} milliseconds (cache_graph={cache_graph})"
+            )
         # TTLT: energy per request
         energy_request = self._maybe_finish_energy_logger(energy_ctx, dur, repeats, unit="request")
 
@@ -610,7 +696,7 @@ class ElanaProfiler:
 
             def _inner(prof):
                 for _ in range(5):
-                    run_once(batch_size, prompt_len, gen_len)
+                    run_once(batch_size, prompt_len, gen_len, verbose=False)
                     prof.step()
 
             self._run_torch_profiler(
@@ -631,6 +717,17 @@ class ElanaProfiler:
         model_name = self.model_name
         micro_batch_size = args.batch_size // getattr(args, "world_size", 1)
         logger.info(f"[Rank {self.local_rank}] Using micro-batch size: {micro_batch_size}")
+        if self._benchmark_prompts is not None:
+            args.repeats = len(self._benchmark_prompts)
+            lengths = [p.shape[1] for p in self._benchmark_prompts]
+            args.prompt_len = max(lengths)
+            logger.info(
+                f"[Rank {self.local_rank}] Using HumanEval benchmark prompts "
+                f"({len(self._benchmark_prompts)} problems, repeats auto-set to {args.repeats}, "
+                f"prompt_len auto-set to {args.prompt_len} (max of {min(lengths)}-{max(lengths)}))"
+            )
+        else:
+            logger.info(f"[Rank {self.local_rank}] Using random token inputs")
         metrics = {}
 
         # ---- size profiling ----
@@ -676,12 +773,19 @@ class ElanaProfiler:
 
         # ---- TTLT ----
         if args.ttlt:
+            use_cache_graph = args.cache_graph
+            if use_cache_graph and self._benchmark_prompts is not None:
+                logger.warning(
+                    f"[Rank {self.local_rank}] CUDA graphs require fixed shapes, "
+                    f"incompatible with variable-length benchmark prompts. Disabling --cache_graph for TTLT."
+                )
+                use_cache_graph = False
             ttlt_latency_ms, ttlt_energy_j = self.profile_ttlt(
                 batch_size=micro_batch_size,
                 prompt_len=args.prompt_len,
                 gen_len=args.gen_len,
                 repeats=args.repeats,
-                cache_graph=args.cache_graph,
+                cache_graph=use_cache_graph,
                 torch_profile=args.torch_profile,
                 torch_profile_dir=f"torch_profile/{model_name}",
             )

@@ -16,6 +16,7 @@ ELANA provides a simple command-line interface and optional **energy consumption
 - 🔌 **GPU energy logging support** for both multi-GPUs on servers and edge GPUs on jetson series
 - 🔥 Optional **Torch Profiler** integration for kernel-level insights, similar to Nvidia Nsight Compute
 - 🧱 Compatible with any HuggingFace `AutoModelForCausalLM` model and self-developed model classes
+- 📊 **HumanEval benchmark mode** for profiling with realistic coding prompts at natural lengths
 
 ---
 
@@ -70,6 +71,42 @@ elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --cache_graph
 ```bash
 elana meta-llama/Llama-3.2-3B-Instruct --size
 ```
+
+### Multi-GPU profiling
+Use `--ngpus` to distribute profiling across multiple GPUs:
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttft --energy --ngpus 4
+```
+
+Note: `batch_size` must be divisible by and >= the number of GPUs.
+
+To select specific GPUs, use `CUDA_VISIBLE_DEVICES`:
+```bash
+CUDA_VISIBLE_DEVICES=2,3 elana meta-llama/Llama-3.2-3B-Instruct --ttft --ngpus 2
+```
+
+You can also control model placement with `--device_map` (defaults to `auto`; overridden to `None` when `--cache_graph` is used):
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttft --device_map auto
+```
+
+### Benchmark with HumanEval prompts
+Use real coding prompts from the [HumanEval](https://huggingface.co/datasets/openai/openai_humaneval) dataset instead of random token inputs:
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --gen_len 1024
+```
+
+Limit the number of prompts:
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --gen_len 1024
+```
+
+To see the actual output:
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --gen_len 1024 --verbose
+```
+
+
 
 ## 📚 More Usage Examples
 ```bash
