@@ -7,6 +7,8 @@ import torch.distributed as dist
 from torch.autograd.profiler import record_function
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
+from transformers import StaticCache
+
 from .size import dynamic_cache_nbytes
 from .trace_handler import trace_handler
 from .energy import launch_energy_logger_process
@@ -216,6 +218,32 @@ class ElanaProfiler:
             size=(batch_size, prompt_len),
             device=self.device,
         )
+
+    def _make_padded_prompt(self, batch_size, prompt_len):
+        """Return (prompt, attention_mask) left-padded to prompt_len."""
+        if self._benchmark_prompts is not None:
+            raw = self._next_benchmark_prompt()  # (1, natural_len)
+            natural_len = raw.shape[1]
+            pad_len = prompt_len - natural_len
+            pad_token_id = self.tokenizer.pad_token_id or 0
+            if pad_len > 0:
+                prompt = torch.nn.functional.pad(raw, (pad_len, 0), value=pad_token_id)
+                mask = torch.cat([
+                    torch.zeros(1, pad_len, dtype=torch.long, device=self.device),
+                    torch.ones(1, natural_len, dtype=torch.long, device=self.device),
+                ], dim=1)
+            else:
+                # natural_len >= prompt_len — truncate from left
+                prompt = raw[:, -prompt_len:]
+                mask = torch.ones(1, prompt_len, dtype=torch.long, device=self.device)
+            return prompt, mask
+        else:
+            prompt = torch.randint(
+                low=0, high=self.vocab_size,
+                size=(batch_size, prompt_len), device=self.device,
+            )
+            mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=self.device)
+            return prompt, mask
 
     def _maybe_start_energy_logger(self):
         if not getattr(self.args, "energy", False):
@@ -547,25 +575,41 @@ class ElanaProfiler:
         vocab_size = self.vocab_size
         cache_position = torch.arange(1, device=device)
 
-        # cache the graph for generation
+        # Variables for cache_graph path (StaticCache)
+        static_cache = None
+        prefill_positions = None
+
+        # cache the graph for generation using StaticCache
         if cache_graph:
-            torch.cuda.set_device(self.device)  # NEW
-            dummy_prompt = self._make_prompt(batch_size, prompt_len)
+            torch.cuda.set_device(self.device)
+
+            static_cache = StaticCache(
+                config=self.model.config,
+                batch_size=batch_size,
+                max_cache_len=prompt_len + gen_len,
+                device=device,
+                dtype=self.dtype,
+            )
+            prefill_positions = torch.arange(prompt_len, device=device)
+
+            # Prefill with padded prompt to populate static_cache
+            prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
             with torch.no_grad():
-                outputs = self.model(
-                    dummy_prompt,
+                self.model(
+                    prompt,
+                    attention_mask=mask,
+                    past_key_values=static_cache,
+                    cache_position=prefill_positions,
                     use_cache=True,
                     output_hidden_states=False,
                     output_attentions=False,
                 )
-                if hasattr(outputs, "past_key_values"):
-                    past_key_values = outputs.past_key_values
-                else:
-                    past_key_values = outputs.cache_params
 
             input_token = torch.randint(
                 low=0, high=vocab_size, size=(batch_size, 1), device=device
             )
+
+            # Warmup decode steps on a side stream
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
@@ -573,8 +617,7 @@ class ElanaProfiler:
                     for _ in range(3):
                         _ = self.model(
                             input_token,
-                            past_key_values=past_key_values,
-                            cache_params=past_key_values,
+                            past_key_values=static_cache,
                             cache_position=cache_position,
                             use_cache=True,
                             output_hidden_states=False,
@@ -582,13 +625,13 @@ class ElanaProfiler:
                         )
             torch.cuda.current_stream().wait_stream(s)
 
+            # Capture CUDA graph for decode step
             with torch.no_grad():
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     out = self.model(
                         input_token,
-                        past_key_values=past_key_values,
-                        cache_params=past_key_values,
+                        past_key_values=static_cache,
                         cache_position=cache_position,
                         use_cache=True,
                         output_hidden_states=False,
@@ -613,49 +656,91 @@ class ElanaProfiler:
                 return out
 
         def run_once(batch_size, prompt_len, gen_len, verbose=False):
-            prompt = self._make_prompt(batch_size, prompt_len)
-            actual_prompt_len = prompt.shape[1]
-            sequences = [prompt]
+            if static_cache is not None:
+                # ---- cache_graph path (StaticCache) ----
+                static_cache.reset()
+                prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
+                actual_prompt_len = prompt.shape[1]
+                sequences = [prompt]
 
-            # prefilling
-            outputs = self.model(
-                sequences[-1],
-                use_cache=True,
-                output_hidden_states=False,
-                output_attentions=False,
-            )
-            if hasattr(outputs, "past_key_values"):
-                past_key_values = outputs.past_key_values
-            else:
-                past_key_values = outputs.cache_params
+                # Prefill with static_cache
+                outputs = self.model(
+                    prompt,
+                    attention_mask=mask,
+                    past_key_values=static_cache,
+                    cache_position=prefill_positions,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
 
-            sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-            sequences.append(sampled_tokens)
-
-            # generation
-            eos_token_id = self.tokenizer.eos_token_id
-            current_past_key_values = past_key_values
-            for i in range(gen_len - 1):  # one token already generated
-                if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
-                    break
-                cache_position.fill_(actual_prompt_len + i)
-                outputs = generate(sequences[-1], current_past_key_values)
-                if hasattr(outputs, "past_key_values"):
-                    current_past_key_values = outputs.past_key_values
-                else:
-                    current_past_key_values = outputs.cache_params
                 sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
 
-            actual_gen_len = len(sequences) - 1  # exclude the prompt
-            run_stats.append((actual_prompt_len, actual_gen_len))
+                # Generation loop with CUDA graph replay
+                eos_token_id = self.tokenizer.eos_token_id
+                for i in range(gen_len - 1):
+                    if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
+                        break
+                    cache_position.fill_(actual_prompt_len + i)
+                    outputs = generate(sequences[-1], None)
+                    sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                    sequences.append(sampled_tokens)
 
-            if verbose and self._benchmark_prompts is not None:
-                input_text = self.tokenizer.decode(prompt[0], skip_special_tokens=True)
-                generated_tokens = torch.cat(sequences[1:], dim=-1)
-                output_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-                logger.info(f"[Rank {self.local_rank}] [INPUT]\n{input_text}")
-                logger.info(f"[Rank {self.local_rank}] [OUTPUT]\n{output_text}")
+                actual_gen_len = len(sequences) - 1
+                run_stats.append((actual_prompt_len, actual_gen_len))
+
+                if verbose and self._benchmark_prompts is not None:
+                    input_text = self.tokenizer.decode(prompt[0], skip_special_tokens=True)
+                    generated_tokens = torch.cat(sequences[1:], dim=-1)
+                    output_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+                    logger.info(f"[Rank {self.local_rank}] [INPUT]\n{input_text}")
+                    logger.info(f"[Rank {self.local_rank}] [OUTPUT]\n{output_text}")
+            else:
+                # ---- non-graph path (DynamicCache) ----
+                prompt = self._make_prompt(batch_size, prompt_len)
+                actual_prompt_len = prompt.shape[1]
+                sequences = [prompt]
+
+                # prefilling
+                outputs = self.model(
+                    sequences[-1],
+                    use_cache=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
+                if hasattr(outputs, "past_key_values"):
+                    past_key_values = outputs.past_key_values
+                else:
+                    past_key_values = outputs.cache_params
+
+                sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                sequences.append(sampled_tokens)
+
+                # generation
+                eos_token_id = self.tokenizer.eos_token_id
+                current_past_key_values = past_key_values
+                for i in range(gen_len - 1):
+                    if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
+                        break
+                    cache_position.fill_(actual_prompt_len + i)
+                    outputs = generate(sequences[-1], current_past_key_values)
+                    if hasattr(outputs, "past_key_values"):
+                        current_past_key_values = outputs.past_key_values
+                    else:
+                        current_past_key_values = outputs.cache_params
+                    sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                    sequences.append(sampled_tokens)
+
+                actual_gen_len = len(sequences) - 1
+                run_stats.append((actual_prompt_len, actual_gen_len))
+
+                if verbose and self._benchmark_prompts is not None:
+                    input_text = self.tokenizer.decode(prompt[0], skip_special_tokens=True)
+                    generated_tokens = torch.cat(sequences[1:], dim=-1)
+                    output_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
+                    logger.info(f"[Rank {self.local_rank}] [INPUT]\n{input_text}")
+                    logger.info(f"[Rank {self.local_rank}] [OUTPUT]\n{output_text}")
 
         run_stats = []
 
@@ -773,19 +858,12 @@ class ElanaProfiler:
 
         # ---- TTLT ----
         if args.ttlt:
-            use_cache_graph = args.cache_graph
-            if use_cache_graph and self._benchmark_prompts is not None:
-                logger.warning(
-                    f"[Rank {self.local_rank}] CUDA graphs require fixed shapes, "
-                    f"incompatible with variable-length benchmark prompts. Disabling --cache_graph for TTLT."
-                )
-                use_cache_graph = False
             ttlt_latency_ms, ttlt_energy_j = self.profile_ttlt(
                 batch_size=micro_batch_size,
                 prompt_len=args.prompt_len,
                 gen_len=args.gen_len,
                 repeats=args.repeats,
-                cache_graph=use_cache_graph,
+                cache_graph=args.cache_graph,
                 torch_profile=args.torch_profile,
                 torch_profile_dir=f"torch_profile/{model_name}",
             )
