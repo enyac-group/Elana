@@ -13,7 +13,7 @@ from functools import partial
 import torch
 import torch.distributed as dist
 from torch.autograd.profiler import record_function
-from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForImageTextToText, AutoProcessor, Qwen3VLProcessor
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoModelForVision2Seq
 
 from .size import dynamic_cache_nbytes
 from .trace_handler import trace_handler
@@ -22,6 +22,7 @@ from .energy import stop_energy_logger_process
 from .logger_utils import set_logger
 
 ###NEW IMPORTS FOR VLMs
+from transformers import AutoModelForCausalLM, AutoProcessor
 from PIL import Image
 import numpy as np
 
@@ -92,18 +93,10 @@ class ElanaProfiler:
         #     tokenizer.pad_token = tokenizer.eos_token
         #ADJUST TO ACCOUNT FOR AutoProcessor instead of AutoTokenizer
         logger.info(f"[Rank {self.local_rank}] Loading processor from {self.args.model_repo}...")
-        # AutoProcessor has a bug with Qwen3VL's video processor config in transformers 5.x
-        # Use the specific class directly as a workaround
-        if "qwen3" in self.args.model_repo.lower():
-            processor = Qwen3VLProcessor.from_pretrained(
-                self.args.model_repo,
-                trust_remote_code=True,
-            )
-        else:
-            processor = AutoProcessor.from_pretrained(
-                self.args.model_repo,
-                trust_remote_code=True,
-            )
+        processor = AutoProcessor.from_pretrained(
+            self.args.model_repo,
+            trust_remote_code=True,
+        )
 
         # --- Device / rank ---
         is_distributed = dist.is_available() and dist.is_initialized()
@@ -121,7 +114,7 @@ class ElanaProfiler:
         # --- Model ---
         if is_distributed or self.device_map is None:
             # Single GPU per process
-            model = AutoModelForImageTextToText.from_pretrained(
+            model = AutoModelForVision2Seq.from_pretrained(
                 self.args.model_repo,
                 torch_dtype=self.dtype,
                 low_cpu_mem_usage=True,
@@ -129,7 +122,7 @@ class ElanaProfiler:
             ).to(device)
         else:
             # Single-process multi-GPU sharding
-            model = AutoModelForImageTextToText.from_pretrained(
+            model = AutoModelForVision2Seq.from_pretrained(
                 self.args.model_repo,
                 torch_dtype=self.dtype,
                 device_map=self.device_map,
