@@ -1,6 +1,8 @@
 import os
+import math
 import logging
 from functools import partial
+from tqdm import tqdm
 
 import torch
 import torch.distributed as dist
@@ -211,7 +213,17 @@ class ElanaProfiler:
 
     def _make_prompt(self, batch_size, prompt_len):
         if self._benchmark_prompts is not None:
-            return self._next_benchmark_prompt()
+            prompts = [self._next_benchmark_prompt() for _ in range(batch_size)]
+            # Pad each to prompt_len and stack
+            pad_token_id = self.tokenizer.pad_token_id or 0
+            padded = []
+            for raw in prompts:
+                if raw.shape[1] < prompt_len:
+                    raw = torch.nn.functional.pad(raw, (prompt_len - raw.shape[1], 0), value=pad_token_id)
+                else:
+                    raw = raw[:, -prompt_len:]
+                padded.append(raw)
+            return torch.cat(padded, dim=0)
         return torch.randint(
             low=0,
             high=self.vocab_size,
@@ -222,21 +234,24 @@ class ElanaProfiler:
     def _make_padded_prompt(self, batch_size, prompt_len):
         """Return (prompt, attention_mask) left-padded to prompt_len."""
         if self._benchmark_prompts is not None:
-            raw = self._next_benchmark_prompt()  # (1, natural_len)
-            natural_len = raw.shape[1]
-            pad_len = prompt_len - natural_len
             pad_token_id = self.tokenizer.pad_token_id or 0
-            if pad_len > 0:
-                prompt = torch.nn.functional.pad(raw, (pad_len, 0), value=pad_token_id)
-                mask = torch.cat([
-                    torch.zeros(1, pad_len, dtype=torch.long, device=self.device),
-                    torch.ones(1, natural_len, dtype=torch.long, device=self.device),
-                ], dim=1)
-            else:
-                # natural_len >= prompt_len — truncate from left
-                prompt = raw[:, -prompt_len:]
-                mask = torch.ones(1, prompt_len, dtype=torch.long, device=self.device)
-            return prompt, mask
+            prompts, masks = [], []
+            for _ in range(batch_size):
+                raw = self._next_benchmark_prompt()  # (1, natural_len)
+                natural_len = raw.shape[1]
+                pad_len = prompt_len - natural_len
+                if pad_len > 0:
+                    p = torch.nn.functional.pad(raw, (pad_len, 0), value=pad_token_id)
+                    m = torch.cat([
+                        torch.zeros(1, pad_len, dtype=torch.long, device=self.device),
+                        torch.ones(1, natural_len, dtype=torch.long, device=self.device),
+                    ], dim=1)
+                else:
+                    p = raw[:, -prompt_len:]
+                    m = torch.ones(1, prompt_len, dtype=torch.long, device=self.device)
+                prompts.append(p)
+                masks.append(m)
+            return torch.cat(prompts, dim=0), torch.cat(masks, dim=0)
         else:
             prompt = torch.randint(
                 low=0, high=self.vocab_size,
@@ -299,7 +314,7 @@ class ElanaProfiler:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            for _ in range(repeats):
+            for _ in tqdm(range(repeats), desc="Profiling", leave=False):
                 fn()
             end.record()
             torch.cuda.synchronize(self.device)
@@ -663,10 +678,6 @@ class ElanaProfiler:
                 # ---- cache_graph path (StaticCache) ----
                 static_cache.reset()
                 prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
-                # Benchmark prompts return batch=1; expand to match CUDA graph batch_size
-                if prompt.shape[0] < batch_size:
-                    prompt = prompt.expand(batch_size, -1).contiguous()
-                    mask = mask.expand(batch_size, -1).contiguous()
                 actual_prompt_len = prompt.shape[1]
                 sequences = [prompt]
 
@@ -698,11 +709,12 @@ class ElanaProfiler:
                 run_stats.append((actual_prompt_len, actual_gen_len))
 
                 if verbose and self._benchmark_prompts is not None:
-                    input_text = self.tokenizer.decode(prompt[0], skip_special_tokens=True)
                     generated_tokens = torch.cat(sequences[1:], dim=-1)
-                    output_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-                    logger.info(f"[Rank {self.local_rank}] [INPUT]\n{input_text}")
-                    logger.info(f"[Rank {self.local_rank}] [OUTPUT]\n{output_text}")
+                    for b in range(prompt.shape[0]):
+                        input_text = self.tokenizer.decode(prompt[b], skip_special_tokens=True)
+                        output_text = self.tokenizer.decode(generated_tokens[b], skip_special_tokens=True)
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [INPUT]\n{input_text}")
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [OUTPUT]\n{output_text}")
             else:
                 # ---- non-graph path (DynamicCache) ----
                 prompt = self._make_prompt(batch_size, prompt_len)
@@ -743,11 +755,12 @@ class ElanaProfiler:
                 run_stats.append((actual_prompt_len, actual_gen_len))
 
                 if verbose and self._benchmark_prompts is not None:
-                    input_text = self.tokenizer.decode(prompt[0], skip_special_tokens=True)
                     generated_tokens = torch.cat(sequences[1:], dim=-1)
-                    output_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
-                    logger.info(f"[Rank {self.local_rank}] [INPUT]\n{input_text}")
-                    logger.info(f"[Rank {self.local_rank}] [OUTPUT]\n{output_text}")
+                    for b in range(prompt.shape[0]):
+                        input_text = self.tokenizer.decode(prompt[b], skip_special_tokens=True)
+                        output_text = self.tokenizer.decode(generated_tokens[b], skip_special_tokens=True)
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [INPUT]\n{input_text}")
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [OUTPUT]\n{output_text}")
 
         run_stats = []
 
@@ -810,12 +823,14 @@ class ElanaProfiler:
         micro_batch_size = args.batch_size // getattr(args, "world_size", 1)
         logger.info(f"[Rank {self.local_rank}] Using micro-batch size: {micro_batch_size}")
         if self._benchmark_prompts is not None:
-            args.repeats = len(self._benchmark_prompts)
+            num_prompts = len(self._benchmark_prompts)
+            args.repeats = math.ceil(num_prompts / micro_batch_size)
             lengths = [p.shape[1] for p in self._benchmark_prompts]
             args.prompt_len = max(lengths)
             logger.info(
                 f"[Rank {self.local_rank}] Using HumanEval benchmark prompts "
-                f"({len(self._benchmark_prompts)} problems, repeats auto-set to {args.repeats}, "
+                f"({num_prompts} problems, batch_size={micro_batch_size}, "
+                f"repeats auto-set to {args.repeats}, "
                 f"prompt_len auto-set to {args.prompt_len} (max of {min(lengths)}-{max(lengths)}))"
             )
         else:
