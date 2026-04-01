@@ -202,9 +202,11 @@ class ElanaProfiler:
             text = prompt_builder(sample)
             if has_chat_template:
                 messages = [{"role": "user", "content": text}]
-                token_ids = self.tokenizer.apply_chat_template(
+                result = self.tokenizer.apply_chat_template(
                     messages, return_tensors="pt", add_generation_prompt=True,
                 )
+                # apply_chat_template may return a BatchEncoding or a plain tensor
+                token_ids = result["input_ids"] if hasattr(result, "keys") else result
             else:
                 token_ids = self.tokenizer(
                     text,

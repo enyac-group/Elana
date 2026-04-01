@@ -16,7 +16,7 @@ ELANA provides a simple command-line interface and optional **energy consumption
 - 🔌 **GPU energy logging support** for both multi-GPUs on servers and edge GPUs on jetson series
 - 🔥 Optional **Torch Profiler** integration for kernel-level insights, similar to Nvidia Nsight Compute
 - 🧱 Compatible with any HuggingFace `AutoModelForCausalLM` model and self-developed model classes
-- 📊 **HumanEval benchmark mode** for profiling with realistic coding prompts at natural lengths
+- 📊 **Benchmark mode** with multiple datasets (HumanEval, GSM8K, TriviaQA, NarrativeQA, XSum, IFEval) for profiling with realistic prompts
 
 ---
 
