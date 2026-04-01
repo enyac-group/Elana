@@ -22,7 +22,6 @@ def main():
     parser.add_argument("--energy", action="store_true", help="enable energy profiling")
     parser.add_argument("--cache_graph", action="store_true", help="enable cache graph")
     parser.add_argument("--benchmark", action="store_true", help="use HumanEval coding benchmark prompts instead of random inputs")
-    parser.add_argument("--num_prompts", type=int, default=None, help="number of benchmark prompts to use (default: all 164)")
     parser.add_argument("--verbose", action="store_true", help="print input prompts and generated outputs (TTLT benchmark mode only)")
     parser.add_argument("--log_level", type=str, default="INFO", help="log level")
 
@@ -45,7 +44,6 @@ def main():
     if args.energy: profiler_args.append("--energy")
     if args.cache_graph: profiler_args.append("--cache_graph")
     if args.benchmark: profiler_args.append("--benchmark")
-    if args.num_prompts is not None: profiler_args.append(f"--num_prompts={args.num_prompts}")
     if args.verbose: profiler_args.append("--verbose")
 
     # Unknown args are forwarded (nice CLI flexibility)

@@ -1,5 +1,4 @@
 import os
-import math
 import logging
 from functools import partial
 from tqdm import tqdm
@@ -151,10 +150,17 @@ class ElanaProfiler:
             # shape: (1, natural_len)
             all_prompts.append(token_ids.to(self.device))
 
-        num_prompts = getattr(self.args, "num_prompts", None)
-        if num_prompts is not None:
-            num_prompts = min(num_prompts, len(all_prompts))
-            all_prompts = all_prompts[:num_prompts]
+        batch_size = self.args.batch_size
+        requested = self.args.repeats * batch_size
+        if requested > len(all_prompts):
+            logger.warning(
+                f"[Rank {self.local_rank}] repeats*batch_size ({self.args.repeats}*{batch_size}={requested}) "
+                f"exceeds available prompts ({len(all_prompts)}), "
+                f"capping repeats to {len(all_prompts) // batch_size}"
+            )
+            requested = (len(all_prompts) // batch_size) * batch_size
+            self.args.repeats = requested // batch_size
+        all_prompts = all_prompts[:requested]
 
         self._benchmark_prompts = all_prompts
         self._benchmark_idx = 0
@@ -627,6 +633,10 @@ class ElanaProfiler:
                 low=0, high=vocab_size, size=(batch_size, 1), device=device
             )
 
+            # Pre-allocate a static attention mask for CUDA graph capture.
+            # Shape: (batch_size, prompt_len + gen_len) — content updated via copy_() before replay.
+            static_attn_mask = torch.ones(batch_size, prompt_len + gen_len, dtype=torch.long, device=device)
+
             # Warmup decode steps on a side stream
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
@@ -635,6 +645,7 @@ class ElanaProfiler:
                     for _ in range(3):
                         _ = self.model(
                             input_token,
+                            attention_mask=static_attn_mask,
                             past_key_values=static_cache,
                             cache_position=cache_position,
                             use_cache=True,
@@ -649,6 +660,7 @@ class ElanaProfiler:
                 with torch.cuda.graph(graph):
                     out = self.model(
                         input_token,
+                        attention_mask=static_attn_mask,
                         past_key_values=static_cache,
                         cache_position=cache_position,
                         use_cache=True,
@@ -656,14 +668,16 @@ class ElanaProfiler:
                         output_attentions=False,
                     )
 
-            def generate(new_input_token, new_past_key_values):
+            def generate(new_input_token, new_attn_mask):
                 input_token.copy_(new_input_token)
+                static_attn_mask.copy_(new_attn_mask)
                 graph.replay()
                 return out
         else:
-            def generate(new_input_token, new_past_key_values):
+            def generate(new_input_token, new_past_key_values, attention_mask=None):
                 out = self.model(
                     new_input_token,
+                    attention_mask=attention_mask,
                     past_key_values=new_past_key_values,
                     cache_params=new_past_key_values,
                     cache_position=cache_position,
@@ -695,13 +709,22 @@ class ElanaProfiler:
                 sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
 
+                # Build full-length attention mask for decode steps.
+                # Start from the prefill mask, extend to max_cache_len, and grow
+                # the valid region by 1 at each decode step.
+                max_cache_len = prompt_len + gen_len
+                decode_mask = torch.zeros(batch_size, max_cache_len, dtype=torch.long, device=device)
+                decode_mask[:, :actual_prompt_len] = mask
+                decode_mask[:, actual_prompt_len] = 1  # first generated token
+
                 # Generation loop with CUDA graph replay
                 eos_token_id = self.tokenizer.eos_token_id
                 for i in range(gen_len - 1):
                     if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
                         break
                     cache_position.fill_(actual_prompt_len + i)
-                    outputs = generate(sequences[-1], None)
+                    decode_mask[:, actual_prompt_len + i] = 1
+                    outputs = generate(sequences[-1], decode_mask)
                     sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
                     sequences.append(sampled_tokens)
 
@@ -717,13 +740,14 @@ class ElanaProfiler:
                         logger.info(f"[Rank {self.local_rank}] [Batch {b}] [OUTPUT]\n{output_text}")
             else:
                 # ---- non-graph path (DynamicCache) ----
-                prompt = self._make_prompt(batch_size, prompt_len)
+                prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
                 actual_prompt_len = prompt.shape[1]
                 sequences = [prompt]
 
                 # prefilling
                 outputs = self.model(
                     sequences[-1],
+                    attention_mask=mask,
                     use_cache=True,
                     output_hidden_states=False,
                     output_attentions=False,
@@ -736,14 +760,15 @@ class ElanaProfiler:
                 sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
 
-                # generation
+                # generation — extend mask by 1 at each step
                 eos_token_id = self.tokenizer.eos_token_id
                 current_past_key_values = past_key_values
                 for i in range(gen_len - 1):
                     if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
                         break
+                    mask = torch.cat([mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
                     cache_position.fill_(actual_prompt_len + i)
-                    outputs = generate(sequences[-1], current_past_key_values)
+                    outputs = generate(sequences[-1], current_past_key_values, attention_mask=mask)
                     if hasattr(outputs, "past_key_values"):
                         current_past_key_values = outputs.past_key_values
                     else:
@@ -824,13 +849,11 @@ class ElanaProfiler:
         logger.info(f"[Rank {self.local_rank}] Using micro-batch size: {micro_batch_size}")
         if self._benchmark_prompts is not None:
             num_prompts = len(self._benchmark_prompts)
-            args.repeats = math.ceil(num_prompts / micro_batch_size)
             lengths = [p.shape[1] for p in self._benchmark_prompts]
             args.prompt_len = max(lengths)
             logger.info(
                 f"[Rank {self.local_rank}] Using HumanEval benchmark prompts "
-                f"({num_prompts} problems, batch_size={micro_batch_size}, "
-                f"repeats auto-set to {args.repeats}, "
+                f"({num_prompts} problems, repeats={args.repeats}, batch_size={micro_batch_size}, "
                 f"prompt_len auto-set to {args.prompt_len} (max of {min(lengths)}-{max(lengths)}))"
             )
         else:

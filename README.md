@@ -93,19 +93,19 @@ elana meta-llama/Llama-3.2-3B-Instruct --ttft --device_map auto
 ### Benchmark with HumanEval prompts
 Use real coding prompts from the [HumanEval](https://huggingface.co/datasets/openai/openai_humaneval) dataset instead of random token inputs:
 ```bash
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --gen_len 1024
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --gen_len 1024
 ```
 
-Limit the number of prompts:
+Limit the number of prompts (total prompts = `repeats * batch_size`):
 ```bash
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --gen_len 1024
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --repeats 10 --batch_size 2 --gen_len 1024
 # or to cache cuda graph
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --cache_graph  --gen_len 1024
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --repeats 10 --batch_size 2 --cache_graph --gen_len 1024
 ```
 
 To see the actual output:
 ```bash
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --gen_len 1024 --verbose
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --repeats 10 --gen_len 1024 --verbose
 ```
 
 
