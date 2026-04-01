@@ -64,7 +64,7 @@ class ElanaProfiler:
         # Load benchmark data if requested
         self._benchmark_prompts = None
         self._benchmark_idx = 0
-        if getattr(args, "benchmark", False):
+        if getattr(args, "benchmark", None):
             self._load_benchmark_data()
 
     # ---------------------- model loading ----------------------
@@ -125,25 +125,89 @@ class ElanaProfiler:
 
     # ---------------------- benchmark data ----------------------
 
+    # Supported benchmark datasets: name -> (hf_path, hf_config, split, prompt_builder)
+    # prompt_builder(sample) -> str
+    BENCHMARK_DATASETS = {
+        "humaneval": {
+            "hf_path": "openai/openai_humaneval",
+            "hf_config": None,
+            "split": "test",
+            "prompt_builder": lambda s: s["prompt"],
+            "description": "Code generation (HumanEval)",
+        },
+        "gsm8k": {
+            "hf_path": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "test",
+            "prompt_builder": lambda s: s["question"],
+            "description": "Math reasoning (GSM8K)",
+        },
+        "triviaqa": {
+            "hf_path": "mandarjoshi/trivia_qa",
+            "hf_config": "rc.nocontext",
+            "split": "validation",
+            "prompt_builder": lambda s: s["question"],
+            "description": "Knowledge & QA (TriviaQA)",
+        },
+        "narrativeqa": {
+            "hf_path": "deepmind/narrativeqa",
+            "hf_config": None,
+            "split": "test",
+            "prompt_builder": lambda s: (
+                s["document"]["summary"] + "\n\nQuestion: " + s["question"]["text"]
+            ),
+            "description": "Long-context QA (NarrativeQA)",
+        },
+        "xsum": {
+            "hf_path": "EdinburghNLP/xsum",
+            "hf_config": None,
+            "split": "test",
+            "prompt_builder": lambda s: (
+                "Summarize the following article:\n\n" + s["document"]
+            ),
+            "description": "Text summarization (XSum)",
+        },
+        "ifeval": {
+            "hf_path": "google/IFEval",
+            "hf_config": None,
+            "split": "train",
+            "prompt_builder": lambda s: s["prompt"],
+            "description": "Instruction following (IFEval)",
+        },
+    }
+
     def _load_benchmark_data(self):
-        """Load and tokenize HumanEval coding benchmark prompts at their natural lengths."""
+        """Load and tokenize benchmark prompts at their natural lengths."""
         from datasets import load_dataset
 
-        logger.info(f"[Rank {self.local_rank}] Loading HumanEval benchmark dataset...")
-        dataset = load_dataset("openai/openai_humaneval", split="test")
+        benchmark_name = getattr(self.args, "benchmark", "humaneval")
+        if benchmark_name not in self.BENCHMARK_DATASETS:
+            available = ", ".join(self.BENCHMARK_DATASETS.keys())
+            raise ValueError(
+                f"Unknown benchmark '{benchmark_name}'. Available: {available}"
+            )
+
+        cfg = self.BENCHMARK_DATASETS[benchmark_name]
+        logger.info(
+            f"[Rank {self.local_rank}] Loading benchmark dataset: "
+            f"{cfg['description']} ({cfg['hf_path']})..."
+        )
+        dataset = load_dataset(cfg["hf_path"], cfg["hf_config"], split=cfg["split"])
 
         has_chat_template = hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template is not None
+        prompt_builder = cfg["prompt_builder"]
 
         all_prompts = []
         for sample in dataset:
+            text = prompt_builder(sample)
             if has_chat_template:
-                messages = [{"role": "user", "content": sample["prompt"]}]
+                messages = [{"role": "user", "content": text}]
                 token_ids = self.tokenizer.apply_chat_template(
                     messages, return_tensors="pt", add_generation_prompt=True,
                 )
             else:
                 token_ids = self.tokenizer(
-                    sample["prompt"],
+                    text,
                     return_tensors="pt",
                     truncation=False,
                 )["input_ids"]
@@ -166,7 +230,7 @@ class ElanaProfiler:
         self._benchmark_idx = 0
         lengths = [p.shape[1] for p in self._benchmark_prompts]
         logger.info(
-            f"[Rank {self.local_rank}] Loaded {len(self._benchmark_prompts)} HumanEval prompts "
+            f"[Rank {self.local_rank}] Loaded {len(self._benchmark_prompts)} {benchmark_name} prompts "
             f"(token lengths: {min(lengths)}-{max(lengths)}, mean={sum(lengths)/len(lengths):.0f})"
         )
 
@@ -852,7 +916,7 @@ class ElanaProfiler:
             lengths = [p.shape[1] for p in self._benchmark_prompts]
             args.prompt_len = max(lengths)
             logger.info(
-                f"[Rank {self.local_rank}] Using HumanEval benchmark prompts "
+                f"[Rank {self.local_rank}] Using {args.benchmark} benchmark prompts "
                 f"({num_prompts} problems, repeats={args.repeats}, batch_size={micro_batch_size}, "
                 f"prompt_len auto-set to {args.prompt_len} (max of {min(lengths)}-{max(lengths)}))"
             )

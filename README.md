@@ -90,22 +90,34 @@ You can also control model placement with `--device_map` (defaults to `auto`; ov
 elana meta-llama/Llama-3.2-3B-Instruct --ttft --device_map auto
 ```
 
-### Benchmark with HumanEval prompts
-Use real coding prompts from the [HumanEval](https://huggingface.co/datasets/openai/openai_humaneval) dataset instead of random token inputs:
+### Benchmark with real prompts
+Use real prompts from popular datasets instead of random token inputs. Available datasets:
+
+| Name | Category | Dataset | Split |
+|------|----------|---------|-------|
+| `humaneval` | Code generation | [openai/openai_humaneval](https://huggingface.co/datasets/openai/openai_humaneval) | test (164) |
+| `gsm8k` | Math reasoning | [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) | test (1,319) |
+| `triviaqa` | Knowledge & QA | [mandarjoshi/trivia_qa](https://huggingface.co/datasets/mandarjoshi/trivia_qa) | validation (18,669) |
+| `narrativeqa` | Long-context QA | [deepmind/narrativeqa](https://huggingface.co/datasets/deepmind/narrativeqa) | test (10,550) |
+| `xsum` | Summarization | [EdinburghNLP/xsum](https://huggingface.co/datasets/EdinburghNLP/xsum) | test (11,334) |
+| `ifeval` | Instruction following | [google/IFEval](https://huggingface.co/datasets/google/IFEval) | train (541) |
+
 ```bash
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --gen_len 1024
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --gen_len 512
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark gsm8k --gen_len 512
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark xsum --gen_len 512
 ```
 
 Limit the number of prompts (total prompts = `repeats * batch_size`):
 ```bash
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --repeats 10 --batch_size 2 --gen_len 1024
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --repeats 10 --batch_size 2 --gen_len 1024
 # or to cache cuda graph
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --repeats 10 --batch_size 2 --cache_graph --gen_len 1024
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --repeats 10 --batch_size 2 --cache_graph --gen_len 1024
 ```
 
 To see the actual output:
 ```bash
-elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark --repeats 10 --gen_len 1024 --verbose
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --repeats 10 --gen_len 1024 --verbose
 ```
 
 
