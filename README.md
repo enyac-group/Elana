@@ -99,6 +99,8 @@ elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --gen_len 1024
 Limit the number of prompts:
 ```bash
 elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --gen_len 1024
+# or to cache cuda graph
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --benchmark --num_prompts 20 --cache_graph  --gen_len 1024
 ```
 
 To see the actual output:

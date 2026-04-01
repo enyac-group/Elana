@@ -592,8 +592,11 @@ class ElanaProfiler:
             )
             prefill_positions = torch.arange(prompt_len, device=device)
 
-            # Prefill with padded prompt to populate static_cache
-            prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
+            # Prefill with dummy prompt to populate static_cache
+            # Use random tokens (not _make_padded_prompt) to guarantee correct batch_size,
+            # since benchmark prompts always return batch=1.
+            prompt = torch.randint(0, vocab_size, (batch_size, prompt_len), device=device)
+            mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
             with torch.no_grad():
                 self.model(
                     prompt,
@@ -660,6 +663,10 @@ class ElanaProfiler:
                 # ---- cache_graph path (StaticCache) ----
                 static_cache.reset()
                 prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
+                # Benchmark prompts return batch=1; expand to match CUDA graph batch_size
+                if prompt.shape[0] < batch_size:
+                    prompt = prompt.expand(batch_size, -1).contiguous()
+                    mask = mask.expand(batch_size, -1).contiguous()
                 actual_prompt_len = prompt.shape[1]
                 sequences = [prompt]
 
