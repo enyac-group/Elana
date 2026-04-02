@@ -195,6 +195,7 @@ class ElanaProfiler:
         dataset = load_dataset(cfg["hf_path"], cfg["hf_config"], split=cfg["split"])
 
         has_chat_template = hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template is not None
+        enable_thinking = getattr(self.args, "thinking", False)
         prompt_builder = cfg["prompt_builder"]
 
         all_prompts = []
@@ -202,8 +203,12 @@ class ElanaProfiler:
             text = prompt_builder(sample)
             if has_chat_template:
                 messages = [{"role": "user", "content": text}]
+                template_kwargs = dict(
+                    return_tensors="pt", add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
                 result = self.tokenizer.apply_chat_template(
-                    messages, return_tensors="pt", add_generation_prompt=True,
+                    messages, **template_kwargs,
                 )
                 # apply_chat_template may return a BatchEncoding or a plain tensor
                 token_ids = result["input_ids"] if hasattr(result, "keys") else result
@@ -872,11 +877,30 @@ class ElanaProfiler:
         avg_ms = dur / repeats
 
         if run_stats:
-            avg_prompt = sum(s[0] for s in run_stats) / len(run_stats)
-            avg_gen = sum(s[1] for s in run_stats) / len(run_stats)
+            import statistics
+            gen_lens = sorted([s[1] for s in run_stats])
+
+            def _boxplot_stats(data):
+                n = len(data)
+                q1 = statistics.median(data[:n // 2])
+                q2 = statistics.median(data)
+                q3 = statistics.median(data[(n + 1) // 2:])
+                iqr = q3 - q1
+                std = statistics.stdev(data) if n > 1 else 0.0
+                return min(data), q1, q2, q3, max(data), sum(data) / n, iqr, std
+
+            g_min, g_q1, g_med, g_q3, g_max, g_avg, g_iqr, g_std = _boxplot_stats(gen_lens)
+
             logger.info(
-                f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} ms (cache_graph={cache_graph}), "
-                f"avg prompt_len: {avg_prompt:.0f}, avg gen_len: {avg_gen:.0f}"
+                f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} ms (cache_graph={cache_graph})"
+            )
+            logger.info(
+                f"[Rank {self.local_rank}] Output length — "
+                f"min: {g_min}, Q1: {g_q1}, median: {g_med}, Q3: {g_q3}, max: {g_max}, "
+                f"mean: {g_avg:.0f}, IQR: {g_iqr}, std: {g_std:.1f}"
+            )
+            logger.info(
+                f"[Rank {self.local_rank}] Thinking mode: {'enabled' if getattr(self.args, 'thinking', False) else 'disabled'}"
             )
         else:
             logger.info(
@@ -917,10 +941,21 @@ class ElanaProfiler:
             num_prompts = len(self._benchmark_prompts)
             lengths = [p.shape[1] for p in self._benchmark_prompts]
             args.prompt_len = max(lengths)
+            import statistics
+            p_q1 = statistics.median(lengths[:len(lengths) // 2])
+            p_med = statistics.median(lengths)
+            p_q3 = statistics.median(lengths[(len(lengths) + 1) // 2:])
+            p_iqr = p_q3 - p_q1
+            p_std = statistics.stdev(lengths) if len(lengths) > 1 else 0.0
             logger.info(
                 f"[Rank {self.local_rank}] Using {args.benchmark} benchmark prompts "
                 f"({num_prompts} problems, repeats={args.repeats}, batch_size={micro_batch_size}, "
                 f"prompt_len auto-set to {args.prompt_len} (max of {min(lengths)}-{max(lengths)}))"
+            )
+            logger.info(
+                f"[Rank {self.local_rank}] Prompt length — "
+                f"min: {min(lengths)}, Q1: {p_q1}, median: {p_med}, Q3: {p_q3}, max: {max(lengths)}, "
+                f"mean: {sum(lengths)/len(lengths):.0f}, IQR: {p_iqr}, std: {p_std:.1f}"
             )
         else:
             logger.info(f"[Rank {self.local_rank}] Using random token inputs")
