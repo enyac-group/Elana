@@ -25,6 +25,7 @@ def main():
                         help="use benchmark prompts: humaneval, gsm8k, triviaqa, narrativeqa, xsum, ifeval")
     parser.add_argument("--thinking", action="store_true", help="enable thinking mode for models that support it (e.g. Qwen3)")
     parser.add_argument("--verbose", action="store_true", help="print input prompts and generated outputs (TTLT benchmark mode only)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0, help="repetition penalty (1.0 = disabled, >1.0 = penalize repeats)")
     parser.add_argument("--log_level", type=str, default="INFO", help="log level")
 
     args, unknown = parser.parse_known_args()
@@ -48,6 +49,7 @@ def main():
     if args.benchmark: profiler_args.append(f"--benchmark={args.benchmark}")
     if args.thinking: profiler_args.append("--thinking")
     if args.verbose: profiler_args.append("--verbose")
+    if args.repetition_penalty != 1.0: profiler_args.append(f"--repetition_penalty={args.repetition_penalty}")
 
     # Unknown args are forwarded (nice CLI flexibility)
     profiler_args.extend(unknown)

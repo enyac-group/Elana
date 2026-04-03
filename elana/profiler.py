@@ -56,10 +56,12 @@ class ElanaProfiler:
         self.model, self.tokenizer = self._hf_build_model_and_tokenizer()
         self.model.eval()
 
-        # Convenience handle
-        self.vocab_size = self.model.config.vocab_size
+        # Convenience handle — some models (e.g. Gemma-3) nest vocab_size under text_config
+        cfg = self.model.config
+        self.vocab_size = getattr(cfg, "vocab_size", None) or getattr(cfg, "text_config", cfg).vocab_size
 
         self.verbose = getattr(args, "verbose", False)
+        self.repetition_penalty = getattr(args, "repetition_penalty", 1.0)
 
         # Load benchmark data if requested
         self._benchmark_prompts = None
@@ -103,6 +105,23 @@ class ElanaProfiler:
         )
 
         # --- Model ---
+        # Models with hybrid attention (e.g. Gemma-2 alternating full/sliding layers)
+        # need 'eager' attention for CUDA graph compatibility.  SDPA passes
+        # sliding_window to F.scaled_dot_product_attention, which enforces
+        # that the mask's kv dimension equals sliding_window — incompatible
+        # with our pre-allocated full-length 4D masks.
+        extra_kwargs = {}
+        if getattr(self.args, "cache_graph", False):
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(self.args.model_repo, trust_remote_code=True)
+            _lt = getattr(_cfg, "layer_types", None)
+            if _lt is not None and len(set(_lt)) > 1:
+                extra_kwargs["attn_implementation"] = "eager"
+                logger.info(
+                    f"[Rank {self.local_rank}] Hybrid-attention model detected "
+                    f"(layer_types); forcing attn_implementation='eager' for CUDA graph"
+                )
+
         if is_distributed or self.device_map is None:
             # Single GPU per process
             model = AutoModelForCausalLM.from_pretrained(
@@ -110,6 +129,7 @@ class ElanaProfiler:
                 dtype=self.dtype,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
+                **extra_kwargs,
             ).to(device)
         else:
             # Single-process multi-GPU sharding
@@ -119,6 +139,7 @@ class ElanaProfiler:
                 device_map=self.device_map,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
+                **extra_kwargs,
             )
 
         return model, tokenizer
@@ -154,7 +175,7 @@ class ElanaProfiler:
             "hf_config": None,
             "split": "test",
             "prompt_builder": lambda s: (
-                s["document"]["summary"] + "\n\nQuestion: " + s["question"]["text"]
+                s["document"]["summary"]["text"] + "\n\nQuestion: " + s["question"]["text"]
             ),
             "description": "Long-context QA (NarrativeQA)",
         },
@@ -307,6 +328,22 @@ class ElanaProfiler:
             size=(batch_size, prompt_len),
             device=self.device,
         )
+
+    @staticmethod
+    def _apply_repetition_penalty(logits, generated_tokens, penalty):
+        """Apply repetition penalty to logits for already-generated tokens."""
+        if penalty == 1.0 or not generated_tokens:
+            return logits
+        # Gather all generated token IDs
+        token_ids = torch.cat(generated_tokens, dim=-1)  # (batch, seq)
+        for b in range(logits.shape[0]):
+            unique_ids = token_ids[b].unique()
+            score = logits[b, unique_ids]
+            # Penalize: divide positive scores, multiply negative scores
+            logits[b, unique_ids] = torch.where(
+                score > 0, score / penalty, score * penalty
+            )
+        return logits
 
     def _make_padded_prompt(self, batch_size, prompt_len):
         """Return (prompt, attention_mask) left-padded to prompt_len."""
@@ -704,9 +741,35 @@ class ElanaProfiler:
                 low=0, high=vocab_size, size=(batch_size, 1), device=device
             )
 
-            # Pre-allocate a static attention mask for CUDA graph capture.
-            # Shape: (batch_size, prompt_len + gen_len) — content updated via copy_() before replay.
-            static_attn_mask = torch.ones(batch_size, prompt_len + gen_len, dtype=torch.long, device=device)
+            max_cache_len = prompt_len + gen_len
+
+            # Detect hybrid-attention models (e.g. Gemma-2) that alternate
+            # full-attention and sliding-window layers.  For these models we
+            # pre-allocate 4D masks (one per attention type) and pass them as
+            # a dict so the model skips its internal mask creation — which is
+            # incompatible with CUDA graph capture.
+            _layer_types = getattr(self.model.config, "layer_types", None)
+            _hybrid_attention = _layer_types is not None and len(set(_layer_types)) > 1
+
+            if _hybrid_attention:
+                _sliding_window = getattr(self.model.config, "sliding_window", 4096)
+                min_dtype = torch.finfo(self.dtype).min
+                # 4D masks: (batch, 1, 1, kv_len) — updated via copy_() before replay.
+                # Full-attention layers cache all tokens (max_cache_len),
+                # sliding-window layers cache only the last sliding_window tokens.
+                _full_4d = torch.zeros(batch_size, 1, 1, max_cache_len, device=device, dtype=self.dtype)
+                _slide_kv_len = min(_sliding_window, max_cache_len)
+                _slide_4d = torch.zeros(batch_size, 1, 1, _slide_kv_len, device=device, dtype=self.dtype)
+                static_attn_mask = {"full_attention": _full_4d, "sliding_attention": _slide_4d}
+            else:
+                # Pre-allocate a static 2D attention mask for CUDA graph capture.
+                # Shape: (batch_size, prompt_len + gen_len) — content updated via copy_() before replay.
+                static_attn_mask = torch.ones(batch_size, max_cache_len, dtype=torch.long, device=device)
+
+            # For hybrid-attention models, explicitly pass position_ids so
+            # the model doesn't infer them from past_key_values.get_seq_length()
+            # (which can return a Python int that gets baked into the graph).
+            _position_ids = cache_position.unsqueeze(0) if _hybrid_attention else None
 
             # Warmup decode steps on a side stream
             s = torch.cuda.Stream()
@@ -717,6 +780,7 @@ class ElanaProfiler:
                         _ = self.model(
                             input_token,
                             attention_mask=static_attn_mask,
+                            position_ids=_position_ids,
                             past_key_values=static_cache,
                             cache_position=cache_position,
                             use_cache=True,
@@ -732,6 +796,7 @@ class ElanaProfiler:
                     out = self.model(
                         input_token,
                         attention_mask=static_attn_mask,
+                        position_ids=_position_ids,
                         past_key_values=static_cache,
                         cache_position=cache_position,
                         use_cache=True,
@@ -739,11 +804,47 @@ class ElanaProfiler:
                         output_attentions=False,
                     )
 
-            def generate(new_input_token, new_attn_mask):
-                input_token.copy_(new_input_token)
-                static_attn_mask.copy_(new_attn_mask)
-                graph.replay()
-                return out
+            if _hybrid_attention:
+                logger.info(f"[Rank {self.local_rank}] Using hybrid-attention CUDA graph path (sliding_window={_sliding_window})")
+                # Collect the cumulative_length tensors from sliding-window layers.
+                # The CUDA graph captures the "not full" branch of
+                # StaticSlidingWindowLayer.update(), which uses index_copy_
+                # with cumulative_length.  We must keep that tensor within
+                # [0, sliding_window) so index_copy_ never writes out of
+                # bounds once cumulative_length_int >= sliding_window.
+                _slide_cum_lengths = []
+                for layer in static_cache.layers:
+                    if hasattr(layer, "cumulative_length") and getattr(layer, "is_sliding", False):
+                        _slide_cum_lengths.append(layer)
+
+                def generate(new_input_token, decode_mask_2d):
+                    """Update pre-allocated 4D masks from a 2D mask and replay."""
+                    input_token.copy_(new_input_token)
+                    pos = cache_position.item()
+                    # Full attention: attend to all valid (non-zero) positions
+                    _full_4d.fill_(min_dtype)
+                    _full_4d[0, 0, 0, :pos + 1] = torch.where(
+                        decode_mask_2d[0, :pos + 1].bool(),
+                        torch.zeros(1, device=device, dtype=self.dtype),
+                        torch.full((1,), min_dtype, device=device, dtype=self.dtype),
+                    )
+                    # Sliding window: all positions in the buffer are valid
+                    _slide_4d.zero_()  # 0.0 = attend
+                    # Keep sliding-window cumulative_length tensor within
+                    # [0, sliding_window) so the graph-captured index_copy_
+                    # never overflows.  cumulative_length_int (Python int) is
+                    # NOT updated during graph replay, but the tensor IS
+                    # (via the captured add_ kernel), so we must always wrap.
+                    for layer in _slide_cum_lengths:
+                        layer.cumulative_length.remainder_(_sliding_window)
+                    graph.replay()
+                    return out
+            else:
+                def generate(new_input_token, new_attn_mask):
+                    input_token.copy_(new_input_token)
+                    static_attn_mask.copy_(new_attn_mask)
+                    graph.replay()
+                    return out
         else:
             def generate(new_input_token, new_past_key_values, attention_mask=None):
                 out = self.model(
@@ -777,7 +878,10 @@ class ElanaProfiler:
                     output_attentions=False,
                 )
 
-                sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                logits = outputs.logits[:, -1, :]
+                if self.repetition_penalty != 1.0:
+                    logits = self._apply_repetition_penalty(logits, [], self.repetition_penalty)
+                sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
 
                 # Build full-length attention mask for decode steps.
@@ -796,7 +900,10 @@ class ElanaProfiler:
                     cache_position.fill_(actual_prompt_len + i)
                     decode_mask[:, actual_prompt_len + i] = 1
                     outputs = generate(sequences[-1], decode_mask)
-                    sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                    logits = outputs.logits[:, -1, :].clone()
+                    if self.repetition_penalty != 1.0:
+                        logits = self._apply_repetition_penalty(logits, sequences[1:], self.repetition_penalty)
+                    sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
                     sequences.append(sampled_tokens)
 
                 actual_gen_len = len(sequences) - 1
@@ -828,7 +935,10 @@ class ElanaProfiler:
                 else:
                     past_key_values = outputs.cache_params
 
-                sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                logits = outputs.logits[:, -1, :]
+                if self.repetition_penalty != 1.0:
+                    logits = self._apply_repetition_penalty(logits, [], self.repetition_penalty)
+                sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
 
                 # generation — extend mask by 1 at each step
@@ -844,7 +954,10 @@ class ElanaProfiler:
                         current_past_key_values = outputs.past_key_values
                     else:
                         current_past_key_values = outputs.cache_params
-                    sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                    logits = outputs.logits[:, -1, :]
+                    if self.repetition_penalty != 1.0:
+                        logits = self._apply_repetition_penalty(logits, sequences[1:], self.repetition_penalty)
+                    sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
                     sequences.append(sampled_tokens)
 
                 actual_gen_len = len(sequences) - 1
@@ -942,9 +1055,10 @@ class ElanaProfiler:
             lengths = [p.shape[1] for p in self._benchmark_prompts]
             args.prompt_len = max(lengths)
             import statistics
-            p_q1 = statistics.median(lengths[:len(lengths) // 2])
-            p_med = statistics.median(lengths)
-            p_q3 = statistics.median(lengths[(len(lengths) + 1) // 2:])
+            sorted_lengths = sorted(lengths)
+            p_q1 = statistics.median(sorted_lengths[:len(sorted_lengths) // 2])
+            p_med = statistics.median(sorted_lengths)
+            p_q3 = statistics.median(sorted_lengths[(len(sorted_lengths) + 1) // 2:])
             p_iqr = p_q3 - p_q1
             p_std = statistics.stdev(lengths) if len(lengths) > 1 else 0.0
             logger.info(

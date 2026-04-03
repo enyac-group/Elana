@@ -41,6 +41,8 @@ def parse_args():
                         help="Enable thinking mode for models that support it (e.g. Qwen3)")
     parser.add_argument("--verbose", action="store_true",
                         help="Print input prompts and generated outputs (TTLT benchmark mode only)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0,
+                        help="Repetition penalty (1.0 = disabled, >1.0 = penalize repeats)")
 
     parser.add_argument(
         "--device_map",
