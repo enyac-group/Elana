@@ -16,6 +16,7 @@ ELANA provides a simple command-line interface and optional **energy consumption
 - 🔌 **GPU energy logging support** for both multi-GPUs on servers and edge GPUs on jetson series
 - 🔥 Optional **Torch Profiler** integration for kernel-level insights, similar to Nvidia Nsight Compute
 - 🧱 Compatible with any HuggingFace `AutoModelForCausalLM` model and self-developed model classes
+- 📊 **Benchmark mode** with multiple datasets (HumanEval, GSM8K, TriviaQA, NarrativeQA, XSum, IFEval) for profiling with realistic prompts
 
 ---
 
@@ -70,6 +71,56 @@ elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --cache_graph
 ```bash
 elana meta-llama/Llama-3.2-3B-Instruct --size
 ```
+
+### Multi-GPU profiling
+Use `--ngpus` to distribute profiling across multiple GPUs:
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttft --energy --ngpus 4
+```
+
+Note: `batch_size` must be divisible by and >= the number of GPUs.
+
+To select specific GPUs, use `CUDA_VISIBLE_DEVICES`:
+```bash
+CUDA_VISIBLE_DEVICES=2,3 elana meta-llama/Llama-3.2-3B-Instruct --ttft --ngpus 2
+```
+
+You can also control model placement with `--device_map` (defaults to `auto`; overridden to `None` when `--cache_graph` is used):
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttft --device_map auto
+```
+
+### Benchmark with real prompts
+Use real prompts from popular datasets instead of random token inputs. Available datasets:
+
+| Name | Category | Dataset | Split |
+|------|----------|---------|-------|
+| `humaneval` | Code generation | [openai/openai_humaneval](https://huggingface.co/datasets/openai/openai_humaneval) | test (164) |
+| `gsm8k` | Math reasoning | [openai/gsm8k](https://huggingface.co/datasets/openai/gsm8k) | test (1,319) |
+| `triviaqa` | Knowledge & QA | [mandarjoshi/trivia_qa](https://huggingface.co/datasets/mandarjoshi/trivia_qa) | validation (18,669) |
+| `narrativeqa` | Long-context QA | [deepmind/narrativeqa](https://huggingface.co/datasets/deepmind/narrativeqa) | test (10,550) |
+| `xsum` | Summarization | [EdinburghNLP/xsum](https://huggingface.co/datasets/EdinburghNLP/xsum) | test (11,334) |
+| `ifeval` | Instruction following | [google/IFEval](https://huggingface.co/datasets/google/IFEval) | train (541) |
+
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --gen_len 512
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark gsm8k --gen_len 512
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark xsum --gen_len 512
+```
+
+Limit the number of prompts (total prompts = `repeats * batch_size`):
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --repeats 10 --batch_size 2 --gen_len 1024
+# or to cache cuda graph
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --repeats 10 --batch_size 2 --cache_graph --gen_len 1024
+```
+
+To see the actual output:
+```bash
+elana meta-llama/Llama-3.2-3B-Instruct --ttlt --energy --benchmark humaneval --repeats 10 --gen_len 1024 --verbose
+```
+
+
 
 ## 📚 More Usage Examples
 ```bash

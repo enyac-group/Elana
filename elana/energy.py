@@ -8,8 +8,10 @@ from datetime import datetime
 # to profile gpu power
 try:
     from pynvml import *
+    nvmlInit()
     handle = nvmlDeviceGetHandleByIndex(0)
     nvmlDeviceGetPowerUsage(handle)
+    nvmlShutdown()
     _NVML_AVAILABLE = True
 except Exception as e:
     _NVML_AVAILABLE = False
@@ -195,13 +197,15 @@ def log_gpu_stats(
 
 
 def launch_energy_logger_process():
-    gpu_index = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
+    local_rank = int(os.environ.get("LOCAL_RANK", torch.cuda.current_device()))
+    visible_gpus = get_visible_gpus()
+    gpu_index = visible_gpus[local_rank]
     stop_event = Event()
     manager = Manager()
 
     gpu_power = manager.list()
 
-    logger.info(f"[Rank {gpu_index}] Launching GPU energy logger on GPU {gpu_index}")
+    logger.info(f"[Rank {local_rank}] Launching GPU energy logger on physical GPU {gpu_index}")
 
     proc = Process(
         target=log_gpu_stats,

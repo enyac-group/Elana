@@ -21,6 +21,11 @@ def main():
     parser.add_argument("--size", action="store_true", help="enable size")
     parser.add_argument("--energy", action="store_true", help="enable energy profiling")
     parser.add_argument("--cache_graph", action="store_true", help="enable cache graph")
+    parser.add_argument("--benchmark", type=str, default=None, metavar="DATASET",
+                        help="use benchmark prompts: humaneval, gsm8k, triviaqa, narrativeqa, xsum, ifeval")
+    parser.add_argument("--thinking", action="store_true", help="enable thinking mode for models that support it (e.g. Qwen3)")
+    parser.add_argument("--verbose", action="store_true", help="print input prompts and generated outputs (TTLT benchmark mode only)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.0, help="repetition penalty (1.0 = disabled, >1.0 = penalize repeats)")
     parser.add_argument("--log_level", type=str, default="INFO", help="log level")
 
     args, unknown = parser.parse_known_args()
@@ -41,6 +46,10 @@ def main():
     if args.size: profiler_args.append("--size")
     if args.energy: profiler_args.append("--energy")
     if args.cache_graph: profiler_args.append("--cache_graph")
+    if args.benchmark: profiler_args.append(f"--benchmark={args.benchmark}")
+    if args.thinking: profiler_args.append("--thinking")
+    if args.verbose: profiler_args.append("--verbose")
+    if args.repetition_penalty != 1.0: profiler_args.append(f"--repetition_penalty={args.repetition_penalty}")
 
     # Unknown args are forwarded (nice CLI flexibility)
     profiler_args.extend(unknown)

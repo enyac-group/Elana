@@ -1,11 +1,14 @@
 import os
 import logging
 from functools import partial
+from tqdm import tqdm
 
 import torch
 import torch.distributed as dist
 from torch.autograd.profiler import record_function
 from transformers import AutoModelForCausalLM, AutoTokenizer
+
+from transformers import StaticCache
 
 from .size import dynamic_cache_nbytes
 from .trace_handler import trace_handler
@@ -53,8 +56,18 @@ class ElanaProfiler:
         self.model, self.tokenizer = self._hf_build_model_and_tokenizer()
         self.model.eval()
 
-        # Convenience handle
-        self.vocab_size = self.model.config.vocab_size
+        # Convenience handle — some models (e.g. Gemma-3) nest vocab_size under text_config
+        cfg = self.model.config
+        self.vocab_size = getattr(cfg, "vocab_size", None) or getattr(cfg, "text_config", cfg).vocab_size
+
+        self.verbose = getattr(args, "verbose", False)
+        self.repetition_penalty = getattr(args, "repetition_penalty", 1.0)
+
+        # Load benchmark data if requested
+        self._benchmark_prompts = None
+        self._benchmark_idx = 0
+        if getattr(args, "benchmark", None):
+            self._load_benchmark_data()
 
     # ---------------------- model loading ----------------------
 
@@ -92,6 +105,23 @@ class ElanaProfiler:
         )
 
         # --- Model ---
+        # Models with hybrid attention (e.g. Gemma-2 alternating full/sliding layers)
+        # need 'eager' attention for CUDA graph compatibility.  SDPA passes
+        # sliding_window to F.scaled_dot_product_attention, which enforces
+        # that the mask's kv dimension equals sliding_window — incompatible
+        # with our pre-allocated full-length 4D masks.
+        extra_kwargs = {}
+        if getattr(self.args, "cache_graph", False):
+            from transformers import AutoConfig
+            _cfg = AutoConfig.from_pretrained(self.args.model_repo, trust_remote_code=True)
+            _lt = getattr(_cfg, "layer_types", None)
+            if _lt is not None and len(set(_lt)) > 1:
+                extra_kwargs["attn_implementation"] = "eager"
+                logger.info(
+                    f"[Rank {self.local_rank}] Hybrid-attention model detected "
+                    f"(layer_types); forcing attn_implementation='eager' for CUDA graph"
+                )
+
         if is_distributed or self.device_map is None:
             # Single GPU per process
             model = AutoModelForCausalLM.from_pretrained(
@@ -99,6 +129,7 @@ class ElanaProfiler:
                 dtype=self.dtype,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
+                **extra_kwargs,
             ).to(device)
         else:
             # Single-process multi-GPU sharding
@@ -108,9 +139,134 @@ class ElanaProfiler:
                 device_map=self.device_map,
                 low_cpu_mem_usage=True,
                 trust_remote_code=True,
+                **extra_kwargs,
             )
 
         return model, tokenizer
+
+    # ---------------------- benchmark data ----------------------
+
+    # Supported benchmark datasets: name -> (hf_path, hf_config, split, prompt_builder)
+    # prompt_builder(sample) -> str
+    BENCHMARK_DATASETS = {
+        "humaneval": {
+            "hf_path": "openai/openai_humaneval",
+            "hf_config": None,
+            "split": "test",
+            "prompt_builder": lambda s: s["prompt"],
+            "description": "Code generation (HumanEval)",
+        },
+        "gsm8k": {
+            "hf_path": "openai/gsm8k",
+            "hf_config": "main",
+            "split": "test",
+            "prompt_builder": lambda s: s["question"],
+            "description": "Math reasoning (GSM8K)",
+        },
+        "triviaqa": {
+            "hf_path": "mandarjoshi/trivia_qa",
+            "hf_config": "rc.nocontext",
+            "split": "validation",
+            "prompt_builder": lambda s: s["question"],
+            "description": "Knowledge & QA (TriviaQA)",
+        },
+        "narrativeqa": {
+            "hf_path": "deepmind/narrativeqa",
+            "hf_config": None,
+            "split": "test",
+            "prompt_builder": lambda s: (
+                s["document"]["summary"]["text"] + "\n\nQuestion: " + s["question"]["text"]
+            ),
+            "description": "Long-context QA (NarrativeQA)",
+        },
+        "xsum": {
+            "hf_path": "EdinburghNLP/xsum",
+            "hf_config": None,
+            "split": "test",
+            "prompt_builder": lambda s: (
+                "Summarize the following article:\n\n" + s["document"]
+            ),
+            "description": "Text summarization (XSum)",
+        },
+        "ifeval": {
+            "hf_path": "google/IFEval",
+            "hf_config": None,
+            "split": "train",
+            "prompt_builder": lambda s: s["prompt"],
+            "description": "Instruction following (IFEval)",
+        },
+    }
+
+    def _load_benchmark_data(self):
+        """Load and tokenize benchmark prompts at their natural lengths."""
+        from datasets import load_dataset
+
+        benchmark_name = getattr(self.args, "benchmark", "humaneval")
+        if benchmark_name not in self.BENCHMARK_DATASETS:
+            available = ", ".join(self.BENCHMARK_DATASETS.keys())
+            raise ValueError(
+                f"Unknown benchmark '{benchmark_name}'. Available: {available}"
+            )
+
+        cfg = self.BENCHMARK_DATASETS[benchmark_name]
+        logger.info(
+            f"[Rank {self.local_rank}] Loading benchmark dataset: "
+            f"{cfg['description']} ({cfg['hf_path']})..."
+        )
+        dataset = load_dataset(cfg["hf_path"], cfg["hf_config"], split=cfg["split"])
+
+        has_chat_template = hasattr(self.tokenizer, "chat_template") and self.tokenizer.chat_template is not None
+        enable_thinking = getattr(self.args, "thinking", False)
+        prompt_builder = cfg["prompt_builder"]
+
+        all_prompts = []
+        for sample in dataset:
+            text = prompt_builder(sample)
+            if has_chat_template:
+                messages = [{"role": "user", "content": text}]
+                template_kwargs = dict(
+                    return_tensors="pt", add_generation_prompt=True,
+                    enable_thinking=enable_thinking,
+                )
+                result = self.tokenizer.apply_chat_template(
+                    messages, **template_kwargs,
+                )
+                # apply_chat_template may return a BatchEncoding or a plain tensor
+                token_ids = result["input_ids"] if hasattr(result, "keys") else result
+            else:
+                token_ids = self.tokenizer(
+                    text,
+                    return_tensors="pt",
+                    truncation=False,
+                )["input_ids"]
+            # shape: (1, natural_len)
+            all_prompts.append(token_ids.to(self.device))
+
+        batch_size = self.args.batch_size
+        requested = self.args.repeats * batch_size
+        if requested > len(all_prompts):
+            logger.warning(
+                f"[Rank {self.local_rank}] repeats*batch_size ({self.args.repeats}*{batch_size}={requested}) "
+                f"exceeds available prompts ({len(all_prompts)}), "
+                f"capping repeats to {len(all_prompts) // batch_size}"
+            )
+            requested = (len(all_prompts) // batch_size) * batch_size
+            self.args.repeats = requested // batch_size
+        all_prompts = all_prompts[:requested]
+
+        self._benchmark_prompts = all_prompts
+        self._benchmark_idx = 0
+        lengths = [p.shape[1] for p in self._benchmark_prompts]
+        logger.info(
+            f"[Rank {self.local_rank}] Loaded {len(self._benchmark_prompts)} {benchmark_name} prompts "
+            f"(token lengths: {min(lengths)}-{max(lengths)}, mean={sum(lengths)/len(lengths):.0f})"
+        )
+
+    def _next_benchmark_prompt(self):
+        """Return the next benchmark prompt at its natural length (batch_size=1)."""
+        prompt = self._benchmark_prompts[self._benchmark_idx]
+        self._benchmark_idx = (self._benchmark_idx + 1) % len(self._benchmark_prompts)
+        return prompt
 
     # ---------------------- common helpers ----------------------
 
@@ -154,12 +310,69 @@ class ElanaProfiler:
                 inner_loop_fn(prof)
 
     def _make_prompt(self, batch_size, prompt_len):
+        if self._benchmark_prompts is not None:
+            prompts = [self._next_benchmark_prompt() for _ in range(batch_size)]
+            # Pad each to prompt_len and stack
+            pad_token_id = self.tokenizer.pad_token_id or 0
+            padded = []
+            for raw in prompts:
+                if raw.shape[1] < prompt_len:
+                    raw = torch.nn.functional.pad(raw, (prompt_len - raw.shape[1], 0), value=pad_token_id)
+                else:
+                    raw = raw[:, -prompt_len:]
+                padded.append(raw)
+            return torch.cat(padded, dim=0)
         return torch.randint(
             low=0,
             high=self.vocab_size,
             size=(batch_size, prompt_len),
             device=self.device,
         )
+
+    @staticmethod
+    def _apply_repetition_penalty(logits, generated_tokens, penalty):
+        """Apply repetition penalty to logits for already-generated tokens."""
+        if penalty == 1.0 or not generated_tokens:
+            return logits
+        # Gather all generated token IDs
+        token_ids = torch.cat(generated_tokens, dim=-1)  # (batch, seq)
+        for b in range(logits.shape[0]):
+            unique_ids = token_ids[b].unique()
+            score = logits[b, unique_ids]
+            # Penalize: divide positive scores, multiply negative scores
+            logits[b, unique_ids] = torch.where(
+                score > 0, score / penalty, score * penalty
+            )
+        return logits
+
+    def _make_padded_prompt(self, batch_size, prompt_len):
+        """Return (prompt, attention_mask) left-padded to prompt_len."""
+        if self._benchmark_prompts is not None:
+            pad_token_id = self.tokenizer.pad_token_id or 0
+            prompts, masks = [], []
+            for _ in range(batch_size):
+                raw = self._next_benchmark_prompt()  # (1, natural_len)
+                natural_len = raw.shape[1]
+                pad_len = prompt_len - natural_len
+                if pad_len > 0:
+                    p = torch.nn.functional.pad(raw, (pad_len, 0), value=pad_token_id)
+                    m = torch.cat([
+                        torch.zeros(1, pad_len, dtype=torch.long, device=self.device),
+                        torch.ones(1, natural_len, dtype=torch.long, device=self.device),
+                    ], dim=1)
+                else:
+                    p = raw[:, -prompt_len:]
+                    m = torch.ones(1, prompt_len, dtype=torch.long, device=self.device)
+                prompts.append(p)
+                masks.append(m)
+            return torch.cat(prompts, dim=0), torch.cat(masks, dim=0)
+        else:
+            prompt = torch.randint(
+                low=0, high=self.vocab_size,
+                size=(batch_size, prompt_len), device=self.device,
+            )
+            mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=self.device)
+            return prompt, mask
 
     def _maybe_start_energy_logger(self):
         if not getattr(self.args, "energy", False):
@@ -215,7 +428,7 @@ class ElanaProfiler:
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
-            for _ in range(repeats):
+            for _ in tqdm(range(repeats), desc="Profiling", leave=False):
                 fn()
             end.record()
             torch.cuda.synchronize(self.device)
@@ -233,10 +446,9 @@ class ElanaProfiler:
         vocab_size = self.vocab_size
 
         # Dummy prompt for prefilling KV cache
-        dummy_prompt = torch.randint(
-            low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-        )
-        logger.info(f"[Rank {self.local_rank}] Prefilling {prompt_len} tokens to KV cache...")
+        dummy_prompt = self._make_prompt(batch_size, prompt_len)
+        actual_prompt_len = dummy_prompt.shape[1]
+        logger.info(f"[Rank {self.local_rank}] Prefilling {actual_prompt_len} tokens to KV cache...")
         if hasattr(model, "prepare_inputs_for_generation"):
             # Nemotron-H and Mamba2
             with torch.no_grad():
@@ -278,7 +490,7 @@ class ElanaProfiler:
         # print(past_key_values)
         cache_size = dynamic_cache_nbytes(past_key_values)
         cache_size_gb = cache_size / GB
-        logger.info(f'[Rank {self.local_rank}] cache size: {cache_size_gb:.3f} GB (batch size {batch_size}, prompt length {prompt_len})')
+        logger.info(f'[Rank {self.local_rank}] cache size: {cache_size_gb:.3f} GB (batch size {batch_size}, prompt length {actual_prompt_len})')
         # model total size and detailed layer type breakdown
         model_size_gb = (param_size + buffer_size) / GB
         logger.info(f'[Rank {self.local_rank}] model size: {model_size_gb:.3f} GB')
@@ -291,14 +503,21 @@ class ElanaProfiler:
                      repeats=100, torch_profile=False, torch_profile_dir=""):
         logger.info(f"[Rank {self.local_rank}] >>> Profiling TTFT (prefilling stage) for {repeats} times")
 
-        prompt = self._make_prompt(batch_size, prompt_len)
+        use_benchmark = self._benchmark_prompts is not None
 
-        logger.info(f"[Rank {self.local_rank}] Testing (batch_size, prompt_len): ({batch_size}, {prompt_len})")
+        if use_benchmark:
+            logger.info(
+                f"[Rank {self.local_rank}] Testing with HumanEval prompts at natural lengths (batch_size=1)"
+            )
+        else:
+            logger.info(f"[Rank {self.local_rank}] Testing (batch_size, prompt_len): ({batch_size}, {prompt_len})")
+
         logger.info(f"[Rank {self.local_rank}] Warmup...")
         with torch.no_grad():
             for _ in range(5):
+                p = self._make_prompt(batch_size, prompt_len)
                 _ = self.model(
-                    prompt,
+                    p,
                     use_cache=True,
                     output_hidden_states=False,
                     output_attentions=False,
@@ -309,8 +528,9 @@ class ElanaProfiler:
         energy_ctx = self._maybe_start_energy_logger()
 
         def _run_once():
+            p = self._make_prompt(batch_size, prompt_len)
             _ = self.model(
-                prompt,
+                p,
                 use_cache=True,
                 output_hidden_states=False,
                 output_attentions=False,
@@ -326,13 +546,14 @@ class ElanaProfiler:
         )
 
         if torch_profile:
-            outfile_prefix = f"ttft_prompt_len_{prompt_len}"
+            outfile_prefix = f"ttft_prompt_len_{'humaneval' if use_benchmark else prompt_len}"
 
             def _inner(prof):
                 for _ in range(5):
                     with record_function("## forward ##"):
+                        p = self._make_prompt(batch_size, prompt_len)
                         _ = self.model(
-                            prompt,
+                            p,
                             use_cache=True,
                             output_hidden_states=False,
                             output_attentions=False,
@@ -346,7 +567,7 @@ class ElanaProfiler:
                 inner_loop_fn=_inner,
                 warn_msg=None,
             )
-        
+
         return avg_ms, energy_prompt
 
     # ---------------------- TPOT ----------------------
@@ -359,12 +580,10 @@ class ElanaProfiler:
         device = self.device
         vocab_size = self.vocab_size
 
-        # Dummy prompt for prefilling KV cache
-        dummy_prompt = torch.randint(
-            low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-        )
+        # Prompt for prefilling KV cache
+        dummy_prompt = self._make_prompt(batch_size, prompt_len)
 
-        logger.info(f"[Rank {self.local_rank}] Prefilling {prompt_len} tokens to KV cache...")
+        logger.info(f"[Rank {self.local_rank}] Prefilling {dummy_prompt.shape[1]} tokens to KV cache...")
         with torch.no_grad():
             outputs = self.model(
                 dummy_prompt,
@@ -485,27 +704,74 @@ class ElanaProfiler:
         vocab_size = self.vocab_size
         cache_position = torch.arange(1, device=device)
 
-        # cache the graph for generation
+        # Variables for cache_graph path (StaticCache)
+        static_cache = None
+        prefill_positions = None
+
+        # cache the graph for generation using StaticCache
         if cache_graph:
-            torch.cuda.set_device(self.device)  # NEW
-            dummy_prompt = torch.randint(
-                low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
+            torch.cuda.set_device(self.device)
+
+            static_cache = StaticCache(
+                config=self.model.config,
+                batch_size=batch_size,
+                max_cache_len=prompt_len + gen_len,
+                device=device,
+                dtype=self.dtype,
             )
+            prefill_positions = torch.arange(prompt_len, device=device)
+
+            # Prefill with dummy prompt to populate static_cache
+            # Use random tokens (not _make_padded_prompt) to guarantee correct batch_size,
+            # since benchmark prompts always return batch=1.
+            prompt = torch.randint(0, vocab_size, (batch_size, prompt_len), device=device)
+            mask = torch.ones(batch_size, prompt_len, dtype=torch.long, device=device)
             with torch.no_grad():
-                outputs = self.model(
-                    dummy_prompt,
+                self.model(
+                    prompt,
+                    attention_mask=mask,
+                    past_key_values=static_cache,
+                    cache_position=prefill_positions,
                     use_cache=True,
                     output_hidden_states=False,
                     output_attentions=False,
                 )
-                if hasattr(outputs, "past_key_values"):
-                    past_key_values = outputs.past_key_values
-                else:
-                    past_key_values = outputs.cache_params
 
             input_token = torch.randint(
                 low=0, high=vocab_size, size=(batch_size, 1), device=device
             )
+
+            max_cache_len = prompt_len + gen_len
+
+            # Detect hybrid-attention models (e.g. Gemma-2) that alternate
+            # full-attention and sliding-window layers.  For these models we
+            # pre-allocate 4D masks (one per attention type) and pass them as
+            # a dict so the model skips its internal mask creation — which is
+            # incompatible with CUDA graph capture.
+            _layer_types = getattr(self.model.config, "layer_types", None)
+            _hybrid_attention = _layer_types is not None and len(set(_layer_types)) > 1
+
+            if _hybrid_attention:
+                _sliding_window = getattr(self.model.config, "sliding_window", 4096)
+                min_dtype = torch.finfo(self.dtype).min
+                # 4D masks: (batch, 1, 1, kv_len) — updated via copy_() before replay.
+                # Full-attention layers cache all tokens (max_cache_len),
+                # sliding-window layers cache only the last sliding_window tokens.
+                _full_4d = torch.zeros(batch_size, 1, 1, max_cache_len, device=device, dtype=self.dtype)
+                _slide_kv_len = min(_sliding_window, max_cache_len)
+                _slide_4d = torch.zeros(batch_size, 1, 1, _slide_kv_len, device=device, dtype=self.dtype)
+                static_attn_mask = {"full_attention": _full_4d, "sliding_attention": _slide_4d}
+            else:
+                # Pre-allocate a static 2D attention mask for CUDA graph capture.
+                # Shape: (batch_size, prompt_len + gen_len) — content updated via copy_() before replay.
+                static_attn_mask = torch.ones(batch_size, max_cache_len, dtype=torch.long, device=device)
+
+            # For hybrid-attention models, explicitly pass position_ids so
+            # the model doesn't infer them from past_key_values.get_seq_length()
+            # (which can return a Python int that gets baked into the graph).
+            _position_ids = cache_position.unsqueeze(0) if _hybrid_attention else None
+
+            # Warmup decode steps on a side stream
             s = torch.cuda.Stream()
             s.wait_stream(torch.cuda.current_stream())
             with torch.no_grad():
@@ -513,8 +779,9 @@ class ElanaProfiler:
                     for _ in range(3):
                         _ = self.model(
                             input_token,
-                            past_key_values=past_key_values,
-                            cache_params=past_key_values,
+                            attention_mask=static_attn_mask,
+                            position_ids=_position_ids,
+                            past_key_values=static_cache,
                             cache_position=cache_position,
                             use_cache=True,
                             output_hidden_states=False,
@@ -522,27 +789,67 @@ class ElanaProfiler:
                         )
             torch.cuda.current_stream().wait_stream(s)
 
+            # Capture CUDA graph for decode step
             with torch.no_grad():
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     out = self.model(
                         input_token,
-                        past_key_values=past_key_values,
-                        cache_params=past_key_values,
+                        attention_mask=static_attn_mask,
+                        position_ids=_position_ids,
+                        past_key_values=static_cache,
                         cache_position=cache_position,
                         use_cache=True,
                         output_hidden_states=False,
                         output_attentions=False,
                     )
 
-            def generate(new_input_token, new_past_key_values):
-                input_token.copy_(new_input_token)
-                graph.replay()
-                return out
+            if _hybrid_attention:
+                logger.info(f"[Rank {self.local_rank}] Using hybrid-attention CUDA graph path (sliding_window={_sliding_window})")
+                # Collect the cumulative_length tensors from sliding-window layers.
+                # The CUDA graph captures the "not full" branch of
+                # StaticSlidingWindowLayer.update(), which uses index_copy_
+                # with cumulative_length.  We must keep that tensor within
+                # [0, sliding_window) so index_copy_ never writes out of
+                # bounds once cumulative_length_int >= sliding_window.
+                _slide_cum_lengths = []
+                for layer in static_cache.layers:
+                    if hasattr(layer, "cumulative_length") and getattr(layer, "is_sliding", False):
+                        _slide_cum_lengths.append(layer)
+
+                def generate(new_input_token, decode_mask_2d):
+                    """Update pre-allocated 4D masks from a 2D mask and replay."""
+                    input_token.copy_(new_input_token)
+                    pos = cache_position.item()
+                    # Full attention: attend to all valid (non-zero) positions
+                    _full_4d.fill_(min_dtype)
+                    _full_4d[0, 0, 0, :pos + 1] = torch.where(
+                        decode_mask_2d[0, :pos + 1].bool(),
+                        torch.zeros(1, device=device, dtype=self.dtype),
+                        torch.full((1,), min_dtype, device=device, dtype=self.dtype),
+                    )
+                    # Sliding window: all positions in the buffer are valid
+                    _slide_4d.zero_()  # 0.0 = attend
+                    # Keep sliding-window cumulative_length tensor within
+                    # [0, sliding_window) so the graph-captured index_copy_
+                    # never overflows.  cumulative_length_int (Python int) is
+                    # NOT updated during graph replay, but the tensor IS
+                    # (via the captured add_ kernel), so we must always wrap.
+                    for layer in _slide_cum_lengths:
+                        layer.cumulative_length.remainder_(_sliding_window)
+                    graph.replay()
+                    return out
+            else:
+                def generate(new_input_token, new_attn_mask):
+                    input_token.copy_(new_input_token)
+                    static_attn_mask.copy_(new_attn_mask)
+                    graph.replay()
+                    return out
         else:
-            def generate(new_input_token, new_past_key_values):
+            def generate(new_input_token, new_past_key_values, attention_mask=None):
                 out = self.model(
                     new_input_token,
+                    attention_mask=attention_mask,
                     past_key_values=new_past_key_values,
                     cache_params=new_past_key_values,
                     cache_position=cache_position,
@@ -552,54 +859,166 @@ class ElanaProfiler:
                 )
                 return out
 
-        def run_once(batch_size, prompt_len, gen_len):
-            prompt = torch.randint(
-                low=0, high=vocab_size, size=(batch_size, prompt_len), device=device
-            )
-            sequences = [prompt]
+        def run_once(batch_size, prompt_len, gen_len, verbose=False):
+            if static_cache is not None:
+                # ---- cache_graph path (StaticCache) ----
+                static_cache.reset()
+                prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
+                actual_prompt_len = prompt.shape[1]
+                sequences = [prompt]
 
-            # prefilling
-            outputs = self.model(
-                sequences[-1],
-                use_cache=True,
-                output_hidden_states=False,
-                output_attentions=False,
-            )
-            if hasattr(outputs, "past_key_values"):
-                past_key_values = outputs.past_key_values
-            else:
-                past_key_values = outputs.cache_params
+                # Prefill with static_cache
+                outputs = self.model(
+                    prompt,
+                    attention_mask=mask,
+                    past_key_values=static_cache,
+                    cache_position=prefill_positions,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
 
-            sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-            sequences.append(sampled_tokens)
-
-            # generation
-            current_past_key_values = past_key_values
-            for _ in range(gen_len - 1):  # one token already generated
-                outputs = generate(sequences[-1], current_past_key_values)
-                if hasattr(outputs, "past_key_values"):
-                    current_past_key_values = outputs.past_key_values
-                else:
-                    current_past_key_values = outputs.cache_params
-                sampled_tokens = outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
+                logits = outputs.logits[:, -1, :]
+                if self.repetition_penalty != 1.0:
+                    logits = self._apply_repetition_penalty(logits, [], self.repetition_penalty)
+                sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
                 sequences.append(sampled_tokens)
+
+                # Build full-length attention mask for decode steps.
+                # Start from the prefill mask, extend to max_cache_len, and grow
+                # the valid region by 1 at each decode step.
+                max_cache_len = prompt_len + gen_len
+                decode_mask = torch.zeros(batch_size, max_cache_len, dtype=torch.long, device=device)
+                decode_mask[:, :actual_prompt_len] = mask
+                decode_mask[:, actual_prompt_len] = 1  # first generated token
+
+                # Generation loop with CUDA graph replay
+                eos_token_id = self.tokenizer.eos_token_id
+                for i in range(gen_len - 1):
+                    if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
+                        break
+                    cache_position.fill_(actual_prompt_len + i)
+                    decode_mask[:, actual_prompt_len + i] = 1
+                    outputs = generate(sequences[-1], decode_mask)
+                    logits = outputs.logits[:, -1, :].clone()
+                    if self.repetition_penalty != 1.0:
+                        logits = self._apply_repetition_penalty(logits, sequences[1:], self.repetition_penalty)
+                    sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
+                    sequences.append(sampled_tokens)
+
+                actual_gen_len = len(sequences) - 1
+                run_stats.append((actual_prompt_len, actual_gen_len))
+
+                if verbose and self._benchmark_prompts is not None:
+                    generated_tokens = torch.cat(sequences[1:], dim=-1)
+                    for b in range(prompt.shape[0]):
+                        input_text = self.tokenizer.decode(prompt[b], skip_special_tokens=True)
+                        output_text = self.tokenizer.decode(generated_tokens[b], skip_special_tokens=True)
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [INPUT]\n{input_text}")
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [OUTPUT]\n{output_text}")
+            else:
+                # ---- non-graph path (DynamicCache) ----
+                prompt, mask = self._make_padded_prompt(batch_size, prompt_len)
+                actual_prompt_len = prompt.shape[1]
+                sequences = [prompt]
+
+                # prefilling
+                outputs = self.model(
+                    sequences[-1],
+                    attention_mask=mask,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    output_attentions=False,
+                )
+                if hasattr(outputs, "past_key_values"):
+                    past_key_values = outputs.past_key_values
+                else:
+                    past_key_values = outputs.cache_params
+
+                logits = outputs.logits[:, -1, :]
+                if self.repetition_penalty != 1.0:
+                    logits = self._apply_repetition_penalty(logits, [], self.repetition_penalty)
+                sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
+                sequences.append(sampled_tokens)
+
+                # generation — extend mask by 1 at each step
+                eos_token_id = self.tokenizer.eos_token_id
+                current_past_key_values = past_key_values
+                for i in range(gen_len - 1):
+                    if eos_token_id is not None and (sampled_tokens == eos_token_id).all():
+                        break
+                    mask = torch.cat([mask, torch.ones(batch_size, 1, dtype=torch.long, device=device)], dim=1)
+                    cache_position.fill_(actual_prompt_len + i)
+                    outputs = generate(sequences[-1], current_past_key_values, attention_mask=mask)
+                    if hasattr(outputs, "past_key_values"):
+                        current_past_key_values = outputs.past_key_values
+                    else:
+                        current_past_key_values = outputs.cache_params
+                    logits = outputs.logits[:, -1, :]
+                    if self.repetition_penalty != 1.0:
+                        logits = self._apply_repetition_penalty(logits, sequences[1:], self.repetition_penalty)
+                    sampled_tokens = logits.argmax(dim=-1).unsqueeze(1)
+                    sequences.append(sampled_tokens)
+
+                actual_gen_len = len(sequences) - 1
+                run_stats.append((actual_prompt_len, actual_gen_len))
+
+                if verbose and self._benchmark_prompts is not None:
+                    generated_tokens = torch.cat(sequences[1:], dim=-1)
+                    for b in range(prompt.shape[0]):
+                        input_text = self.tokenizer.decode(prompt[b], skip_special_tokens=True)
+                        output_text = self.tokenizer.decode(generated_tokens[b], skip_special_tokens=True)
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [INPUT]\n{input_text}")
+                        logger.info(f"[Rank {self.local_rank}] [Batch {b}] [OUTPUT]\n{output_text}")
+
+        run_stats = []
 
         logger.info(f"[Rank {self.local_rank}] Warmup...")
         with torch.no_grad():
             for _ in range(5):
-                run_once(batch_size, prompt_len, gen_len)
+                run_once(batch_size, prompt_len, gen_len, verbose=False)
+
+        run_stats.clear()
 
         logger.info(f"[Rank {self.local_rank}] Start profiling...")
         energy_ctx = self._maybe_start_energy_logger()
 
         def _run():
-            run_once(batch_size, prompt_len, gen_len)
+            run_once(batch_size, prompt_len, gen_len, verbose=self.verbose)
 
         dur = self._time_repeated(repeats, _run)
         avg_ms = dur / repeats
-        logger.info(
-            f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} milliseconds (cache_graph={cache_graph})"
-        )
+
+        if run_stats:
+            import statistics
+            gen_lens = sorted([s[1] for s in run_stats])
+
+            def _boxplot_stats(data):
+                n = len(data)
+                q1 = statistics.median(data[:n // 2])
+                q2 = statistics.median(data)
+                q3 = statistics.median(data[(n + 1) // 2:])
+                iqr = q3 - q1
+                std = statistics.stdev(data) if n > 1 else 0.0
+                return min(data), q1, q2, q3, max(data), sum(data) / n, iqr, std
+
+            g_min, g_q1, g_med, g_q3, g_max, g_avg, g_iqr, g_std = _boxplot_stats(gen_lens)
+
+            logger.info(
+                f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} ms (cache_graph={cache_graph})"
+            )
+            logger.info(
+                f"[Rank {self.local_rank}] Output length — "
+                f"min: {g_min}, Q1: {g_q1}, median: {g_med}, Q3: {g_q3}, max: {g_max}, "
+                f"mean: {g_avg:.0f}, IQR: {g_iqr}, std: {g_std:.1f}"
+            )
+            logger.info(
+                f"[Rank {self.local_rank}] Thinking mode: {'enabled' if getattr(self.args, 'thinking', False) else 'disabled'}"
+            )
+        else:
+            logger.info(
+                f"[Rank {self.local_rank}] Finished, latency: {avg_ms:.2f} milliseconds (cache_graph={cache_graph})"
+            )
         # TTLT: energy per request
         energy_request = self._maybe_finish_energy_logger(energy_ctx, dur, repeats, unit="request")
 
@@ -610,7 +1029,7 @@ class ElanaProfiler:
 
             def _inner(prof):
                 for _ in range(5):
-                    run_once(batch_size, prompt_len, gen_len)
+                    run_once(batch_size, prompt_len, gen_len, verbose=False)
                     prof.step()
 
             self._run_torch_profiler(
@@ -631,6 +1050,29 @@ class ElanaProfiler:
         model_name = self.model_name
         micro_batch_size = args.batch_size // getattr(args, "world_size", 1)
         logger.info(f"[Rank {self.local_rank}] Using micro-batch size: {micro_batch_size}")
+        if self._benchmark_prompts is not None:
+            num_prompts = len(self._benchmark_prompts)
+            lengths = [p.shape[1] for p in self._benchmark_prompts]
+            args.prompt_len = max(lengths)
+            import statistics
+            sorted_lengths = sorted(lengths)
+            p_q1 = statistics.median(sorted_lengths[:len(sorted_lengths) // 2])
+            p_med = statistics.median(sorted_lengths)
+            p_q3 = statistics.median(sorted_lengths[(len(sorted_lengths) + 1) // 2:])
+            p_iqr = p_q3 - p_q1
+            p_std = statistics.stdev(lengths) if len(lengths) > 1 else 0.0
+            logger.info(
+                f"[Rank {self.local_rank}] Using {args.benchmark} benchmark prompts "
+                f"({num_prompts} problems, repeats={args.repeats}, batch_size={micro_batch_size}, "
+                f"prompt_len auto-set to {args.prompt_len} (max of {min(lengths)}-{max(lengths)}))"
+            )
+            logger.info(
+                f"[Rank {self.local_rank}] Prompt length — "
+                f"min: {min(lengths)}, Q1: {p_q1}, median: {p_med}, Q3: {p_q3}, max: {max(lengths)}, "
+                f"mean: {sum(lengths)/len(lengths):.0f}, IQR: {p_iqr}, std: {p_std:.1f}"
+            )
+        else:
+            logger.info(f"[Rank {self.local_rank}] Using random token inputs")
         metrics = {}
 
         # ---- size profiling ----
